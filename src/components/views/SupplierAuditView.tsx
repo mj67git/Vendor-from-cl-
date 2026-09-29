@@ -1,0 +1,1314 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { Activity, AlertTriangle, Award, Briefcase, Building, Building2, CheckCircle, ChevronLeft, Coins, Factory, FileSpreadsheet, Globe, Handshake, Loader2, Microscope, Pencil, Search, ShieldAlert, Warehouse, X } from 'lucide-react';
+import { BusinessPartner, Material, User, Vendor } from '../../types';
+import type { NavigateFn } from '../../utils/navStack';
+import { EntityName } from '../EntityName';
+import { GradeBadge } from '../GradeBadge';
+import { Pagination } from '../Pagination';
+import { PerPageSelect } from '../ui/per-page-select';
+import { Badge } from '../ui/badge';
+import { Button } from '../ui/button';
+import { Input } from '../ui/input';
+import { PageTitle } from '../ui/page-title';
+import { SortHeader } from '../ui/sort-header';
+import { StatTile } from '../ui/stat-tile';
+import { TableEmptyRow } from '../ui/table-empty-row';
+import { TableSkeletonRows } from '../ui/table-skeleton-rows';
+import { calculateOverallScore, getDisplayCountry } from '../../utils/vendorUtils';
+import { isVendorRejected } from '../../utils/vendorState';
+import { describeSampleStatus, isSampleRecord } from '../../utils/sampleStatus';
+import { getScoreColorClass } from '../../components/ScoreBar';
+import { categoryLabels } from '../../constants/categories';
+import { can, canScoreDepartment, scorableDepartments } from '../../utils/permissions';
+import { GRADE_RANGE_FA, SOP_DOCUMENTS_DEF, describeGrade } from '../../utils/sopEvaluation';
+import { useExcelExport } from '../../hooks/useExcelExport';
+import { authFetch, isLocalMode } from '../../services/authFetch';
+import { cleanPlaceholder, resolveVendorPartner } from '../../utils/vendorPartner';
+import { checkLicenseExpiry } from '../../utils/vendorUtils';
+import { INITIAL_SOURCE_SELECTIONS } from '../../db_source_selections';
+
+// --- View: Supplier Unified Audit & Analysis Module ---
+
+/** The columns of the supplier directory that can be ordered. */
+type SupplierSortField = 'name' | 'role' | 'country' | 'materials' | 'score';
+
+/**
+ * Persian-aware ordering, so «الف» sorts before «ب» rather than by code point.
+ * The same collator the material and user tables use.
+ */
+const collator = new Intl.Collator('fa', { numeric: true, sensitivity: 'base' });
+
+/**
+ * The key that decides "these sources are the same company".
+ *
+ * Grouping stays on the name rather than on the linked business partner: only
+ * 2 of 76 sources currently carry a partner link, so keying on the partner
+ * would split the other 74 apart instead of consolidating anything.
+ *
+ * The normalisation is insurance for real data. Persian text routinely arrives
+ * with the Arabic ي and ك in place of ی and ک, and with a zero-width non-joiner
+ * where a space is meant. Those look identical on screen but are different
+ * strings, so one company would silently become two rows with half its
+ * materials each.
+ */
+export function supplierKey(name: string): string {
+  return (name || '')
+    .replace(/[يﻱﻲ]/g, 'ی')
+    .replace(/[كﻙﻚ]/g, 'ک')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/\u200c/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+ interface SupplierGroup {
+   key: string;
+   name: string;
+   nameEn: string;
+   country: string;
+   contactInfo: string;
+   registrationDate: string;
+   vendors: Vendor[];
+   /**
+    * The company's real sources — everything in `vendors` that is not a sample.
+    *
+    * A sample is a material that arrived for testing, not a material this
+    * company supplies, so it must not be counted as one or let a company into
+    * the audit directory on its own. `vendors` keeps the sample rows because
+    * the company's own file should still show them.
+    */
+   sources: Vendor[];
+   /**
+    * What this company is, taken from its Business Partner record — never
+    * guessed from the name. `unknown` is a real answer: a company with no
+    * partner record has no stated role, and rule 4 makes that role a regulated
+    * fact rather than a label to fill in. `mixed` is the rare company that
+    * appears as both, through different sources.
+    */
+   role: 'manufacturer' | 'supplier' | 'mixed' | 'unknown';
+ }
+
+/**
+ * The icon that says what kind of company this is: the factory for a
+ * manufacturer and the handshake for a seller, the same pair the business
+ * partner repository uses. A company whose role is not recorded — or that is
+ * both — keeps the neutral building rather than being shown as one of them.
+ */
+function roleIcon(role: SupplierGroup['role']) {
+  if (role === 'manufacturer') return Factory;
+  if (role === 'supplier') return Handshake;
+  return Building;
+}
+
+const ROLE_LABEL: Record<SupplierGroup['role'], string> = {
+  manufacturer: 'تولیدکننده',
+  supplier: 'فروشنده',
+  mixed: 'تولیدکننده و فروشنده',
+  unknown: 'نقش ثبت‌نشده',
+};
+
+  interface SupplierAuditViewProps {
+    vendors: Vendor[];
+    onSelectVendor: (vendor: Vendor) => void;
+    currentUser: User | null;
+    partners?: BusinessPartner[];
+    materials?: Material[];
+    /** Jump to another module — used to open the linked partner record. */
+    onNavigate?: NavigateFn;
+    /** True while the first load of the source list is still in flight. */
+    isLoading?: boolean;
+  }
+
+/** The recorded "this is the source we buy from" decision, per material. */
+interface SourceSelection {
+  materialKey: string;
+  category: string;
+  vendorId: string;
+  reason: string;
+  decidedBy: string;
+  decidedAt: string;
+}
+
+  export function SupplierAuditView({ vendors, onSelectVendor, currentUser, partners = [], materials = [], onNavigate, isLoading = false }: SupplierAuditViewProps) {
+    const excel = useExcelExport();
+    /** Taking a file out of the system, as opposed to reading it on screen. */
+    const canExport = can(currentUser, 'data.export');
+    const [searchQuery, setSearchQuery] = useState('');
+    const [selectedSupplierKey, setSelectedSupplierKey] = useState<string | null>(null);
+
+    const [currentPage, setCurrentPage] = useState(1);
+    /** Suppliers per page. Same control and same sizes as every other paged module. */
+    const [perPage, setPerPage] = useState(20);
+    /**
+     * The list is a table now, so it sorts like the other repositories do.
+     * Kept here rather than inside the row loop because the page slice is taken
+     * after sorting — sorting the twenty rows on screen would sort the page,
+     * not the directory.
+     */
+    const [sortField, setSortField] = useState<SupplierSortField>('name');
+    const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
+
+    /** Departments this person may score; drives which figure they are shown. */
+    const myDepartments = useMemo(() => scorableDepartments(currentUser), [currentUser]);
+
+    // The recorded purchasing decisions, so this page can say how many of the
+    // company's materials it is actually the chosen source for.
+    const [selections, setSelections] = useState<SourceSelection[]>([]);
+    useEffect(() => {
+      if (isLocalMode()) {
+        try {
+          const saved = localStorage.getItem('app_source_selections');
+          if (saved) {
+            const parsed = JSON.parse(saved);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setSelections(parsed);
+              return;
+            }
+          }
+        } catch {}
+        setSelections(INITIAL_SOURCE_SELECTIONS as any);
+        return;
+      }
+      authFetch('/api/source-selections')
+        .then(res => (res.ok ? res.json() : null))
+        .then(data => { if (Array.isArray(data)) setSelections(data); })
+        .catch(() => { /* the card simply reports none on record */ });
+    }, []);
+
+    useEffect(() => {
+      setCurrentPage(1);
+    }, [searchQuery, perPage]);
+
+    // Group vendors list by supplier name
+    const supplierGroups = useMemo(() => {
+      const groups: Record<string, SupplierGroup> = {};
+
+      vendors.forEach(v => {
+        const key = supplierKey(v.name);
+        if (!key) return;
+
+        if (!groups[key]) {
+          groups[key] = {
+            key,
+            name: v.name,
+            nameEn: cleanPlaceholder(v.nameEn) || '',
+            country: cleanPlaceholder(getDisplayCountry(v)) || '',
+            contactInfo: v.contactInfo || '',
+            registrationDate: v.registrationDate || '',
+            vendors: [],
+            sources: [],
+            role: 'unknown',
+          };
+        }
+        groups[key].vendors.push(v);
+        if (!isSampleRecord(v)) groups[key].sources.push(v);
+
+        // The role comes from the partner record behind the source, through the
+        // same resolver the detail header uses, so a card and that header can
+        // never disagree about what a company is.
+        const { role } = resolveVendorPartner(v, partners);
+        if (role === 'manufacturer' || role === 'supplier') {
+          const seen = groups[key].role;
+          groups[key].role = seen === 'unknown' || seen === role ? role : 'mixed';
+        }
+      });
+
+      /*
+       * A company whose every row is a sample is not under audit yet: nothing
+       * of it is being supplied, nothing has been scored, and listing it here
+       * would inflate both the directory and the «بدون امتیاز ثبت‌شده» tile
+       * with a shortfall that does not exist. Its samples still live in the
+       * category that owns them.
+       */
+      return Object.values(groups).filter(g => g.sources.length > 0);
+    }, [vendors, partners]);
+
+    /**
+     * The average audit score of a company, over the sources that carry one.
+     *
+     * A person who scores exactly one department sees that department's figure;
+     * everyone else sees the overall score. `null` means "no source of this
+     * company has been scored", which is a different statement from zero and is
+     * printed as such.
+     */
+    const averageScoreOf = useMemo(() => (group: SupplierGroup): number | null => {
+      let sum = 0;
+      let scored = 0;
+      group.sources.forEach(v => {
+        const value = myDepartments.length === 1
+          ? ((v.scores as any)?.[myDepartments[0]] || 0)
+          : calculateOverallScore(v.scores, true);
+        if (value !== null && value > 0) {
+          sum += value;
+          scored++;
+        }
+      });
+      return scored > 0 ? Math.round(sum / scored) : null;
+    }, [myDepartments]);
+
+    /**
+     * The overview strip, computed over the whole directory rather than the
+     * page on screen.
+     *
+     * This was the one repository with no counters at all: the module that
+     * exists to survey suppliers opened on a search box and a table, so the
+     * size and shape of the population it audits were only knowable by reading
+     * every row. The numbers come from `supplierGroups`, so they describe the
+     * directory and not whatever the search has narrowed it to.
+     */
+    const directoryStats = useMemo(() => {
+      const scores = supplierGroups.map(averageScoreOf).filter((n): n is number => n !== null);
+      return {
+        total: supplierGroups.length,
+        manufacturers: supplierGroups.filter(g => g.role === 'manufacturer').length,
+        suppliers: supplierGroups.filter(g => g.role === 'supplier').length,
+        unscored: supplierGroups.length - scores.length,
+        averageScore: scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null,
+      };
+    }, [supplierGroups, averageScoreOf]);
+
+    // Filter matching suppliers list
+    const filteredSuppliers = useMemo(() => {
+      const query = searchQuery.trim().toLowerCase();
+      if (!query) return supplierGroups;
+
+      return supplierGroups.filter(s => 
+        s.name.toLowerCase().includes(query) ||
+        s.nameEn.toLowerCase().includes(query) ||
+        s.country.toLowerCase().includes(query) ||
+        s.sources.some(v => 
+          v.material.toLowerCase().includes(query) ||
+          v.materialEn.toLowerCase().includes(query) ||
+          (v.cas && v.cas.toLowerCase().includes(query))
+        )
+      );
+    }, [supplierGroups, searchQuery]);
+
+    const sortedSuppliers = useMemo(() => {
+      const dir = sortOrder === 'asc' ? 1 : -1;
+      const value = (g: SupplierGroup): string | number => {
+        switch (sortField) {
+          case 'role': return ROLE_LABEL[g.role];
+          case 'country': return g.country || '';
+          case 'materials': return g.sources.length;
+          // An unscored company sorts as the lowest score rather than being
+          // dropped somewhere arbitrary — the same choice the users table makes
+          // for "never signed in".
+          case 'score': return averageScoreOf(g) ?? -1;
+          default: return g.name;
+        }
+      };
+      return [...filteredSuppliers].sort((a, b) => {
+        const av = value(a);
+        const bv = value(b);
+        const cmp = typeof av === 'number' && typeof bv === 'number'
+          ? av - bv
+          : collator.compare(String(av), String(bv));
+        // Ties fall back to the name so the order never shuffles between renders.
+        return (cmp || collator.compare(a.name, b.name)) * dir;
+      });
+    }, [filteredSuppliers, sortField, sortOrder, averageScoreOf]);
+
+    const handleSort = (field: SupplierSortField) => {
+      if (field === sortField) {
+        setSortOrder(o => (o === 'asc' ? 'desc' : 'asc'));
+      } else {
+        setSortField(field);
+        setSortOrder('asc');
+      }
+      setCurrentPage(1);
+    };
+
+    const ITEMS_PER_PAGE = perPage;
+    const totalItems = sortedSuppliers.length;
+    const totalPages = Math.max(1, Math.ceil(totalItems / ITEMS_PER_PAGE));
+    // Clamped on render, not corrected afterwards: the list shrinks under the
+    // user during a background sync (rule 11a), and a page number left past the
+    // end would render an empty table with no hint of why.
+    const page = Math.min(currentPage, totalPages);
+    const startIndex = (page - 1) * ITEMS_PER_PAGE;
+    const endIndex = startIndex + ITEMS_PER_PAGE;
+    const paginatedSuppliers = useMemo(() => {
+      return sortedSuppliers.slice(startIndex, endIndex);
+    }, [sortedSuppliers, startIndex, endIndex]);
+
+   // Find active supplier details
+   const activeSupplier = useMemo(() => {
+     if (!selectedSupplierKey) return null;
+     return supplierGroups.find(s => s.key === selectedSupplierKey) || null;
+   }, [supplierGroups, selectedSupplierKey]);
+
+    /**
+     * Who this company is, resolved across every source in the group.
+     *
+     * It used to read only `vendors[0]`, so a company whose materials were
+     * linked to different partner records showed just the first one. It also
+     * followed `partner.manufacturerId`, a field the database does not have —
+     * the schema notes that suppliers no longer reference a manufacturer — so
+     * that branch could never run.
+     */
+    const activePartnerDetails = useMemo(() => {
+      if (!activeSupplier) return null;
+
+      const resolved = activeSupplier.vendors
+        .map(v => resolveVendorPartner(v, partners))
+        .filter(info => info.partner);
+
+      const manufacturers = [...new Map(
+        resolved.filter(r => r.role === 'manufacturer').map(r => [r.partner!.id, r])).values()];
+      const suppliers = [...new Map(
+        resolved.filter(r => r.role === 'supplier').map(r => [r.partner!.id, r])).values()];
+
+      const primaryMfg = manufacturers[0] ?? null;
+      const primarySup = suppliers[0] ?? null;
+
+      return {
+        /**
+         * Only a real manufacturer record. This used to fall back to the
+         * group's own name, so a company that is a *seller* — or one not in
+         * Business Partners at all — was labelled «تولید کننده» in the header.
+         * The role is a regulated fact about the company, not a place to put a
+         * name because the line would otherwise be empty (rule 4).
+         */
+        mfgPartner: primaryMfg?.partner ?? null,
+        mfgName: primaryMfg?.name ?? null,
+        mfgCountry: primaryMfg?.country ?? null,
+        supName: primarySup?.name ?? null,
+        supCountry: primarySup?.country ?? null,
+        // «نامشخص» read as if the grade were lost; nobody has evaluated it.
+        supGrade: primarySup?.grade ?? 'ارزیابی نشده',
+        supPartner: primarySup?.partner ?? null,
+        /** More than one distinct partner behind one company name. */
+        extraPartners: Math.max(0, manufacturers.length - 1) + Math.max(0, suppliers.length - 1),
+        linkedCount: resolved.length,
+      };
+    }, [activeSupplier, partners]);
+
+    // Aggregate performance metrics for active supplier
+   const stats = useMemo(() => {
+     if (!activeSupplier) return null;
+
+     /*
+      * The company's supply, which is what these figures are about: a sample is
+      * a material under test, so it has no department scores, no risk
+      * assessment, no licence and no source decision, and counting it here
+      * turned every one of those into a shortfall the company does not have
+      * («هیچ‌کدام از ۲ ماده ارزیابی ریسک ندارد» for a company with one material
+      * and one sample). The laboratory card below is the deliberate exception —
+      * testing is precisely what a sample is for — and `totalItems` stays over
+      * everything because its label says «ماده فعال یا نمونه».
+      */
+     const list = activeSupplier.sources;
+     const totalItems = activeSupplier.vendors.length;
+     /** Only the supply, for the cards whose denominator is a material we buy. */
+     const sourceItems = list.length;
+
+     let scoredCount = 0;
+     let scoresSum = 0;
+     const deptTotals = { commercial: 0, qa: 0, planning: 0, finance: 0 };
+     const deptCounts = { commercial: 0, qa: 0, planning: 0, finance: 0 };
+
+     // Which figure this person should see follows their permissions, not
+     // their job title. Someone responsible for exactly one department sees
+     // that department's average; anyone broader sees the weighted total. Read
+     // off the role, this showed a `commercial` account the commercial score
+     // even after an admin had moved their permission to QA.
+     const myDepartments = scorableDepartments(currentUser);
+     const showsOwnDepartment = myDepartments.length === 1;
+
+     list.forEach(v => {
+       const overall = showsOwnDepartment
+         ? ((v.scores as any)?.[myDepartments[0]] || 0)
+         : calculateOverallScore(v.scores, true);
+       if (overall !== null && overall > 0) {
+         scoresSum += overall;
+         scoredCount++;
+       }
+
+       if (v.scores) {
+         if (v.scores.commercial > 0) { deptTotals.commercial += v.scores.commercial; deptCounts.commercial++; }
+         if (v.scores.qa > 0) { deptTotals.qa += v.scores.qa; deptCounts.qa++; }
+         if (v.scores.planning > 0) { deptTotals.planning += v.scores.planning; deptCounts.planning++; }
+         if (v.scores.finance > 0) { deptTotals.finance += v.scores.finance; deptCounts.finance++; }
+       }
+     });
+ 
+     const avgPerformance = scoredCount > 0 ? Math.round(scoresSum / scoredCount) : null;
+ 
+     const deptAverages = {
+       commercial: deptCounts.commercial > 0 ? Math.round(deptTotals.commercial / deptCounts.commercial) : 0,
+       qa: deptCounts.qa > 0 ? Math.round(deptTotals.qa / deptCounts.qa) : 0,
+       planning: deptCounts.planning > 0 ? Math.round(deptTotals.planning / deptCounts.planning) : 0,
+       finance: deptCounts.finance > 0 ? Math.round(deptTotals.finance / deptCounts.finance) : 0,
+     };
+ 
+     // Group count of items by standard status
+     const statusDistribution = { approved: 0, conditional: 0, rejected: 0, new: 0 };
+     list.forEach(v => {
+       statusDistribution[v.status as keyof typeof statusDistribution] = (statusDistribution[v.status as keyof typeof statusDistribution] || 0) + 1;
+     });
+ 
+     // Find dominant grade representation
+     const gradeCounts: Record<string, number> = {};
+     list.forEach(v => {
+       if (v.grade) {
+         gradeCounts[v.grade] = (gradeCounts[v.grade] || 0) + 1;
+       }
+     });
+ 
+     let dominantGrade = 'N/A';
+     let maxCount = 0;
+     Object.entries(gradeCounts).forEach(([g, count]) => {
+       if (count > maxCount) {
+         maxCount = count;
+         dominantGrade = g;
+       }
+     });
+ 
+     // --- Company-level quality signals -------------------------------------
+     // Each of these existed per material and nowhere per company, which is the
+     // question this page is actually asked.
+
+     // Laboratory record across everything this company supplies.
+     let pass = 0, conditional = 0, reject = 0;
+     activeSupplier.vendors.forEach(v => (v.analysisRecords || []).forEach(r => {
+       if (r.decision === 'Pass') pass++;
+       else if (r.decision === 'Approved Conditional') conditional++;
+       else if (r.decision === 'Reject') reject++;
+     }));
+     const labTotal = pass + conditional + reject;
+     const lab = {
+       pass, conditional, reject, total: labTotal,
+       rate: labTotal > 0 ? Math.round(((pass + conditional) / labTotal) * 100) : null,
+       materialsTested: activeSupplier.vendors.filter(v => (v.analysisRecords || []).length > 0).length,
+     };
+
+     // Risk: the worst case matters more than the average. One High-risk
+     // material is a different conversation from an all-Low portfolio.
+     const riskCounts = { High: 0, Medium: 0, Low: 0, none: 0 };
+     list.forEach(v => {
+       const level = v.riskAssessment?.riskLevel;
+       if (level === 'High' || level === 'Medium' || level === 'Low') riskCounts[level]++;
+       else riskCounts.none++;
+     });
+     const highestRisk = riskCounts.High > 0 ? 'High' : riskCounts.Medium > 0 ? 'Medium' : riskCounts.Low > 0 ? 'Low' : null;
+
+     // Licences about to lapse, or already lapsed.
+     const licences = { expired: 0, expiring: 0 };
+     list.forEach(v => {
+       const check = checkLicenseExpiry(v.ircExpiryDate);
+       if (check.status === 'expired') licences.expired++;
+       else if (check.status === 'expiring_soon') licences.expiring++;
+     });
+
+     // Supply continuity: materials for which this company is the only source
+     // we hold. Nothing else in the app answers this.
+     const soleSource = list.filter(v => {
+       if (v.isSample || isVendorRejected(v)) return false;
+       const key = (v.material || '').trim().toLowerCase();
+       if (!key) return false;
+       const alternatives = vendors.filter(other =>
+         other.id !== v.id &&
+         !other.isSample &&
+         !isVendorRejected(other) &&
+         (other.material || '').trim().toLowerCase() === key &&
+         supplierKey(other.name) !== activeSupplier.key);
+       return alternatives.length === 0;
+     });
+
+     // How many of this company's materials it is the recorded source for.
+     const chosenFor = list.filter(v =>
+       selections.some(sel => sel.vendorId === v.id));
+
+     return {
+       chosenFor,
+       totalItems,
+       sourceItems,
+       avgPerformance,
+       deptAverages,
+       statusDistribution,
+       dominantGrade,
+       showsOwnDepartment,
+       myDepartmentLabel: showsOwnDepartment ? myDepartments[0] : null,
+       lab,
+       riskCounts,
+       highestRisk,
+       licences,
+       soleSource,
+     };
+   }, [activeSupplier, currentUser, vendors, selections]);
+ 
+   return (
+     <div className="space-y-6 fade-in text-right">
+       {/* Breadcrumbs / View switcher header */}
+       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-border pb-5">
+         {/* Same header shape as the repository screens: the title first in
+             source, so RTL puts it on the right and the actions on the left,
+             and `PageTitle` so this page contributes the same single `h1` to
+             the document outline as every other one. */}
+         <PageTitle
+           eyebrow="Supplier Monitoring & Audit"
+           eyebrowIcon={Activity}
+           title={activeSupplier ? 'کارنامه جامع ممیزی و تامین' : 'بررسی یکپارچه تامین‌کنندگان'}
+           subtitle={activeSupplier
+             ? 'تجمیع اطلاعات تامین کالا، پایداری کیفیت و سوابق ممیزی اقلام'
+             : 'مشاهده و مانیتورینگ متمرکز تامین‌کنندگان، تعداد مواد عرضه شده و گرید کیفی میانگین'}
+         />
+
+         {/* Only the way back out of a dossier lives here. The banner that
+             used to sit in this corner announced the module as a "proactive
+             active discovery module", which named nothing a reader could act
+             on and left an empty box on the list view. */}
+         {activeSupplier && (
+           <Button
+             variant="outline"
+             onClick={() => setSelectedSupplierKey(null)}
+           >
+             <ChevronLeft className="rotate-180 text-muted-foreground" />
+             <span>بازگشت به مانیتور جامع تامین‌کنندگان</span>
+           </Button>
+         )}
+
+         {/* The directory export belongs in the header, where the archive, the
+             audit trail and the user module all put theirs — it used to sit
+             inside the search panel, so this was the one module whose export
+             was not where a reader had learned to look for it.
+
+             Only the per-company dossier could be exported before this button
+             existed, so the list a purchasing or quality review starts from had
+             to be retyped off the screen. It exports what the search has
+             narrowed to, in the order the table is sorted, so the file matches
+             what is on screen. */}
+         {!activeSupplier && canExport && (
+           <div className="flex flex-col items-start md:items-end gap-1">
+             <Button
+               type="button"
+               variant="success"
+               size="sm"
+               disabled={excel.busy || sortedSuppliers.length === 0}
+               onClick={() => excel.run(xl => xl.exportSupplierDirectoryToExcel(
+                 sortedSuppliers.map(g => ({
+                   name: g.name,
+                   nameEn: g.nameEn,
+                   role: ROLE_LABEL[g.role],
+                   country: g.country,
+                   materialCount: g.sources.length,
+                   materials: g.sources.map(v => v.material).filter(Boolean),
+                   averageScore: averageScoreOf(g),
+                 })),
+               ), { label: 'فهرست تأمین‌کنندگان', rows: sortedSuppliers.length })}
+               className="font-bold shrink-0"
+             >
+               {excel.busy ? <Loader2 className="animate-spin" /> : <FileSpreadsheet />}
+               <span>خروجی Excel</span>
+             </Button>
+             {excel.error && (
+               <p role="alert" className="text-2xs text-rose-600 dark:text-rose-400 font-bold">{excel.error}</p>
+             )}
+           </div>
+         )}
+ 
+       </div>
+
+       {/* DETAIL VIEW OF SINGLE SUPPLIER */}
+       {activeSupplier && stats ? (
+         <div className="space-y-6">
+           {/* Supplier Profile Banner Card */}
+           <div className="bg-card border border-border rounded-2xl p-6 shadow-sm relative overflow-hidden flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+             <div className="absolute right-0 top-0 bottom-0 w-1.5 bg-primary" />
+             <div className="flex flex-col sm:flex-row sm:items-center gap-4 text-right">
+               <div
+                 className="bg-primary/10 border border-primary/20 text-primary p-3 rounded-xl shrink-0 self-start sm:self-center"
+                 title={ROLE_LABEL[activeSupplier.role]}
+               >
+                 {React.createElement(roleIcon(activeSupplier.role), { className: 'w-7 h-7' })}
+                </div>
+                <div>
+                  {activePartnerDetails ? (
+                    <>
+                      {/* The company's role, only when a partner record states
+                          it. A source links to exactly one partner — a seller
+                          or a manufacturer, never both (rule 4) — so for most
+                          companies only one of these two lines appears. */}
+                      {activePartnerDetails.mfgPartner ? (
+                        <div className="font-bold text-foreground text-xl leading-tight mb-1">
+                          <span>تولیدکننده : {activePartnerDetails.mfgName}</span>
+                          {activePartnerDetails.mfgCountry && (
+                            <>
+                              <span className="mx-3 sm:mx-4 text-muted-foreground/50 font-normal">|</span>
+                              <span>کشور : {activePartnerDetails.mfgCountry}</span>
+                            </>
+                          )}
+                        </div>
+                      ) : !activePartnerDetails.supPartner && (
+                        /* No partner record at all: name the company without
+                           claiming what it does. Saying "تولید کننده" here was
+                           a guess printed as a fact. */
+                        <div className="font-bold text-foreground text-xl leading-tight mb-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+                          <span>{activeSupplier.name}</span>
+                          {activeSupplier.country && (
+                            <span className="font-normal text-muted-foreground text-sm">کشور : {activeSupplier.country}</span>
+                          )}
+                          <span className="text-2xs font-bold bg-muted border border-border text-muted-foreground px-2 py-0.5 rounded-md">
+                            نوع شریک ثبت نشده
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Supplier display (Regular) - Only if Source/Partner has a Supplier */}
+                      {activePartnerDetails.supPartner && (
+                        /* When there is no manufacturer, the seller IS the
+                           company on this page, so it gets the heading weight
+                           instead of reading as a footnote to a missing line. */
+                        <div className={activePartnerDetails.mfgPartner
+                          ? 'font-normal text-muted-foreground text-xs sm:text-sm leading-relaxed mt-1'
+                          : 'font-bold text-foreground text-xl leading-tight mb-1'}>
+                          <span>فروشنده : {activePartnerDetails.supName}</span>
+                          {activePartnerDetails.supCountry && (
+                            <>
+                              <span className="mx-3 text-muted-foreground/50 font-normal">|</span>
+                              <span>کشور : {activePartnerDetails.supCountry}</span>
+                            </>
+                          )}
+                          <span className="mx-3 text-muted-foreground/50 font-normal">|</span>
+                          <span className={activePartnerDetails.mfgPartner ? '' : 'text-sm font-semibold'}>
+                            گرید ارزیابی فروشنده : {describeGrade(activePartnerDetails.supGrade).fa || activePartnerDetails.supGrade}
+                          </span>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="text-sm font-bold text-foreground flex items-center justify-start gap-2.5">
+                      <span>{activeSupplier.name}</span>
+                      {activeSupplier.country && (
+                        <span className="bg-muted border border-border text-muted-foreground text-2xs font-bold px-2 py-0.5 rounded-md font-mono max-w-[200px] truncate" title={activeSupplier.country}>
+                          {activeSupplier.country}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {activeSupplier.nameEn && (
+                    <div className="text-muted-foreground text-xs font-mono mt-1" dir="ltr" style={{ textAlign: 'right' }}>{activeSupplier.nameEn}</div>
+                  )}
+                  {activeSupplier.contactInfo && (
+                    <p className="text-muted-foreground text-xs mt-2 font-mono">{activeSupplier.contactInfo}</p>
+                  )}
+                </div>
+              </div>
+
+             {stats.avgPerformance !== null && (
+               <div className="bg-muted border border-border rounded-2xl p-4 flex items-center gap-4 self-stretch md:self-auto justify-between">
+                 <div className="text-left">
+                   <div className="text-2xs uppercase font-bold text-muted-foreground">{stats.showsOwnDepartment ? 'Departmental Average Rating' : 'Integrated SPS Rating'}</div>
+                   <div className="text-xs text-muted-foreground font-medium font-sans mt-0.5">{stats.showsOwnDepartment ? 'شاخص میانگین عملکرد واحد شما' : 'شاخص کل عملکرد تامین‌کننده'}</div>
+                 </div>
+                 <div className={`text-3xl font-black font-mono leading-none ${getScoreColorClass(stats.avgPerformance)} bg-card px-4 py-3 rounded-xl border border-border shadow-sm`}>
+                   {Math.round(stats.avgPerformance || 0).toLocaleString('en-US')}
+                 </div>
+               </div>
+             )}
+           </div>
+
+           {/* Company-level signals. Each of these was only ever visible per
+               material, which is not the question this page is asked. */}
+           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+             {/* Laboratory record */}
+             <div className="bg-card border border-border rounded-2xl p-4">
+               <div className="flex items-center gap-2 mb-2">
+                 <Microscope className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                 <span className="text-2xs font-bold text-muted-foreground">سابقهٔ آزمایشگاه</span>
+               </div>
+               {stats.lab.total > 0 ? (
+                 <>
+                   <div className={`text-xl font-black font-mono leading-none ${stats.lab.reject > 0 ? 'text-amber-600' : 'text-emerald-600'}`}>
+                     {stats.lab.rate}<span className="text-sm">٪</span>
+                   </div>
+                   <p className="text-2xs text-muted-foreground mt-1.5 leading-relaxed">
+                     {stats.lab.total} تست روی {stats.lab.materialsTested} ماده ·{' '}
+                     <span className="text-emerald-700 dark:text-emerald-400 font-bold">{stats.lab.pass + stats.lab.conditional} قبول</span>
+                     {stats.lab.reject > 0 && (
+                       <> · <span className="text-rose-700 dark:text-rose-400 font-bold">{stats.lab.reject} مردود</span></>
+                     )}
+                   </p>
+                 </>
+               ) : (
+                 <p className="text-2xs text-muted-foreground mt-1">هنوز تستی ثبت نشده است.</p>
+               )}
+             </div>
+
+             {/* Risk — the worst case, not the average */}
+             <div className="bg-card border border-border rounded-2xl p-4">
+               <div className="flex items-center gap-2 mb-2">
+                 <ShieldAlert className="w-3.5 h-3.5 text-orange-600 shrink-0" />
+                 <span className="text-2xs font-bold text-muted-foreground">بالاترین ریسک</span>
+               </div>
+               {stats.highestRisk ? (
+                 <>
+                   <div className={`text-xl font-black leading-none ${
+                     stats.highestRisk === 'High' ? 'text-rose-600'
+                     : stats.highestRisk === 'Medium' ? 'text-amber-600' : 'text-emerald-600'
+                   }`}>
+                     {stats.highestRisk === 'High' ? 'بالا' : stats.highestRisk === 'Medium' ? 'متوسط' : 'پایین'}
+                   </div>
+                   <p className="text-2xs text-muted-foreground mt-1.5 leading-relaxed">
+                     بالا {stats.riskCounts.High} · متوسط {stats.riskCounts.Medium} · پایین {stats.riskCounts.Low}
+                     {stats.riskCounts.none > 0 && (
+                       <> · <span className="text-amber-700 dark:text-amber-400 font-bold">{stats.riskCounts.none} بدون ارزیابی</span></>
+                     )}
+                   </p>
+                 </>
+               ) : (
+                 <p className="text-2xs text-amber-700 dark:text-amber-400 mt-1">
+                   هیچ‌کدام از {stats.sourceItems} ماده ارزیابی ریسک ندارد.
+                 </p>
+               )}
+             </div>
+
+             {/* Licences */}
+             <div className="bg-card border border-border rounded-2xl p-4">
+               <div className="flex items-center gap-2 mb-2">
+                 <AlertTriangle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                 <span className="text-2xs font-bold text-muted-foreground">وضعیت IRC</span>
+               </div>
+               {stats.licences.expired + stats.licences.expiring > 0 ? (
+                 <>
+                   <div className="text-xl font-black font-mono leading-none text-rose-600">
+                     {stats.licences.expired + stats.licences.expiring}
+                   </div>
+                   <p className="text-2xs text-muted-foreground mt-1.5 leading-relaxed">
+                     {stats.licences.expired > 0 && <span className="text-rose-700 dark:text-rose-400 font-bold">{stats.licences.expired} منقضی</span>}
+                     {stats.licences.expired > 0 && stats.licences.expiring > 0 && ' · '}
+                     {stats.licences.expiring > 0 && <span className="text-amber-700 dark:text-amber-400 font-bold">{stats.licences.expiring} نزدیک انقضا</span>}
+                   </p>
+                 </>
+               ) : (
+                 <>
+                   <div className="text-xl font-black font-mono leading-none text-emerald-600">۰</div>
+                   <p className="text-2xs text-muted-foreground mt-1.5">هیچ مجوزی منقضی یا نزدیک انقضا نیست.</p>
+                 </>
+               )}
+             </div>
+
+             {/* Supply continuity */}
+             <div className="bg-card border border-border rounded-2xl p-4">
+               <div className="flex items-center gap-2 mb-2">
+                 <Warehouse className="w-3.5 h-3.5 text-primary shrink-0" />
+                 <span className="text-2xs font-bold text-muted-foreground">تک‌منبع</span>
+               </div>
+               <div className={`text-xl font-black font-mono leading-none ${stats.soleSource.length > 0 ? 'text-amber-600' : 'text-muted-foreground'}`}>
+                 {stats.soleSource.length}
+               </div>
+               <p className="text-2xs text-muted-foreground mt-1.5 leading-relaxed">
+                 {stats.soleSource.length > 0
+                   ? 'مادهٔ بدون سورس جایگزین — قطع تأمین از این شرکت مستقیماً تولید را متوقف می‌کند.'
+                   : 'برای همهٔ مواد این شرکت سورس جایگزین وجود دارد.'}
+               </p>
+             </div>
+           </div>
+
+           {/* SOP documents live on the partner record; this page only ever
+               showed the resulting grade, which says nothing about which
+               paperwork is missing or how old the assessment is. */}
+           <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+             <div className="lg:col-span-2 bg-card border border-border rounded-2xl p-4">
+               <div className="flex items-center justify-between gap-2 mb-3">
+                 <span className="text-2xs font-bold text-muted-foreground flex items-center gap-2">
+                   <Award className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                   ارزیابی مدارک فروشنده
+                 </span>
+                 {activePartnerDetails?.supPartner && onNavigate && (
+                   <button type="button" onClick={() => onNavigate('business-partners')}
+                     className="text-2xs font-bold text-primary hover:underline cursor-pointer shrink-0">
+                     مشاهده در مخزن شرکای تجاری ←
+                   </button>
+                 )}
+               </div>
+
+               {activePartnerDetails?.supPartner?.evaluation ? (
+                 <>
+                   <div className="flex flex-wrap items-center gap-3 mb-3">
+                     {/* A supplier grade, from the supplier table.
+                         `GradeBadge` reads the *source* vocabulary — A, B, C,
+                         rejected — and everything it does not recognise falls
+                         through to its last branch, so this badge announced
+                         «Grade C» for a supplier graded `D`, for one carrying
+                         the retired `Blacklist`, and even for one never
+                         evaluated. `describeGrade` knows every supplier grade
+                         and its colour, and the band is printed beside it so a
+                         reader is not asked to remember the rubric. */}
+                     {(() => {
+                       const ev = activePartnerDetails.supPartner!.evaluation!;
+                       const label = describeGrade(ev.grade);
+                       const band = GRADE_RANGE_FA[ev.grade as keyof typeof GRADE_RANGE_FA];
+                       return (
+                         <>
+                           <span className={`px-2.5 py-1 rounded-lg text-2xs font-bold border ${label.tone}`}>
+                             {ev.grade === 'Not Evaluated' ? 'ارزیابی نشده' : `Grade ${ev.grade}`}
+                             {label.fa && ev.grade !== 'Not Evaluated' ? ` · ${label.fa}` : ''}
+                           </span>
+                           <span className="font-mono font-bold text-foreground text-sm">
+                             {ev.totalScore.toLocaleString('fa-IR')} <span className="text-2xs text-muted-foreground">از ۱۰۰</span>
+                             {band && band !== '—' && (
+                               <span className="text-2xs text-muted-foreground font-sans mr-2">(بازهٔ گرید: {band})</span>
+                             )}
+                           </span>
+                         </>
+                       );
+                     })()}
+                     <span className="text-2xs text-muted-foreground">
+                       آخرین ارزیابی: {activePartnerDetails.supPartner.evaluation.updatedAt
+                         ? new Date(activePartnerDetails.supPartner.evaluation.updatedAt).toLocaleDateString('fa-IR')
+                         : 'نامشخص'}
+                       {activePartnerDetails.supPartner.evaluation.updatedBy && ` · ${activePartnerDetails.supPartner.evaluation.updatedBy}`}
+                     </span>
+                   </div>
+                   <div className="space-y-1">
+                     {SOP_DOCUMENTS_DEF.map(def => {
+                       const doc = activePartnerDetails.supPartner!.evaluation!.documents?.[def.key];
+                       const status = doc?.status || 'Not Submitted';
+                       const tone =
+                         status === 'Approved' ? 'text-emerald-700 dark:text-emerald-400'
+                         : status === 'Permit Approval' ? 'text-blue-700 dark:text-blue-400'
+                         : status === 'Expired' ? 'text-amber-700 dark:text-amber-400'
+                         : 'text-rose-700 dark:text-rose-400';
+                       const label =
+                         status === 'Approved' ? 'تأییدشده'
+                         : status === 'Permit Approval' ? 'تأیید موقت'
+                         : status === 'Expired' ? 'منقضی' : 'ارائه نشده';
+                       return (
+                         <div key={def.key} className="flex items-center justify-between gap-3 text-2xs border-b border-border/50 last:border-0 py-1">
+                           <EntityName name={def.nameFa} lines={1} className="text-foreground" />
+                           <span className={`font-bold shrink-0 ${tone}`}>{label}</span>
+                         </div>
+                       );
+                     })}
+                   </div>
+                 </>
+               ) : (
+                 <p className="text-2xs text-muted-foreground leading-relaxed">
+                   {activePartnerDetails?.supPartner
+                     ? 'این فروشنده هنوز ارزیابی نشده است.'
+                     : 'هیچ‌کدام از اقلام این تأمین‌کننده به یک رکورد فروشنده در مخزن شرکای تجاری متصل نیست، پس ارزیابی فروشنده در دسترس نیست.'}
+                 </p>
+               )}
+             </div>
+
+             {/* Recorded purchasing decisions + the dossier export */}
+             <div className="bg-card border border-border rounded-2xl p-4 flex flex-col justify-between gap-4">
+               <div>
+                 <div className="flex items-center gap-2 mb-2">
+                   <CheckCircle className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                   <span className="text-2xs font-bold text-muted-foreground">سورس منتخب</span>
+                 </div>
+                 <div className="text-xl font-black font-mono leading-none text-foreground">
+                   {stats.chosenFor.length}<span className="text-sm text-muted-foreground"> / {stats.sourceItems}</span>
+                 </div>
+                 <p className="text-2xs text-muted-foreground mt-1.5 leading-relaxed">
+                   {stats.chosenFor.length > 0
+                     ? 'ماده‌ای که این شرکت به‌عنوان سورس منتخب برایش ثبت شده است.'
+                     : 'برای هیچ‌کدام از اقلام این شرکت تصمیم رسمی سورس ثبت نشده است.'}
+                 </p>
+               </div>
+
+               {canExport && (
+               <Button
+                 type="button"
+                 variant="success"
+                 className="w-full"
+                 disabled={excel.busy}
+                 onClick={() => excel.run(xl => xl.exportSupplierDossierToExcel({
+                   supplierName: activeSupplier.name,
+                   vendors: activeSupplier.vendors,
+                   partners,
+                   materials,
+                   chosenMaterials: stats.chosenFor.map(v => v.material),
+                   soleSourceMaterials: stats.soleSource.map(v => v.material),
+                 }), { label: `پروندهٔ ${activeSupplier.name}`, rows: activeSupplier.vendors.length })}
+               >
+                 <Briefcase />
+                 {excel.busy ? 'در حال آماده‌سازی…' : 'خروجی پروندهٔ این تأمین‌کننده'}
+               </Button>
+               )}
+               {excel.error && (
+                 <p className="mt-2 text-2xs text-rose-600 dark:text-rose-400">{excel.error}</p>
+               )}
+             </div>
+           </div>
+
+           {stats.soleSource.length > 0 && (
+             <div className="bg-amber-50/60 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded-2xl p-4">
+               <p className="text-2xs font-bold text-amber-900 dark:text-amber-300 mb-2">
+                 موادی که فقط از این شرکت تأمین می‌شوند:
+               </p>
+               <div className="flex flex-wrap gap-1.5">
+                 {stats.soleSource.map(v => (
+                   <EntityName key={v.id} name={v.material} lines={1}
+                     className="text-2xs bg-card text-foreground px-2 py-1 rounded-lg border border-amber-200 dark:border-amber-800 font-medium max-w-[200px]" />
+                 ))}
+               </div>
+             </div>
+           )}
+
+           {/* Elegant summary callout instead of the 4 boxes */}
+            <div className="bg-muted border border-border/50 rounded-2xl p-4 flex items-center justify-between gap-4 text-right mb-4">
+              <div className="flex items-center gap-3 w-full justify-start">
+                <div className="bg-primary/10 border border-primary/20 text-primary p-2.5 rounded-xl shrink-0">
+                  <Briefcase className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="text-foreground font-bold text-sm">وضعیت تامین کالا</div>
+                  <p className="text-muted-foreground text-xs mt-0.5 leading-relaxed">
+                    تاکنون از این تامین‌کننده تعداد <span className="font-bold font-mono text-foreground text-sm mx-1 bg-card border border-border px-1.5 py-0.5 rounded-md shadow-sm">{stats.totalItems}</span> مورد تامین و ارزیابی شده است که جزئیات عملکرد هر یک به تفکیک در جدول زیر ارائه گردیده است:
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-card border border-border rounded-2xl shadow-sm overflow-hidden mb-6">
+             <div className="bg-muted px-6 py-4 border-b border-border flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+               <div className="w-full sm:w-auto uppercase font-bold text-muted-foreground text-xs tracking-wider text-right">
+                 جدول مقایسه نمرات مواد تامین شده (Materials Performance Matrix)
+               </div>
+               <span className="text-2xs text-primary font-bold bg-primary/10 border border-primary/20 px-2 py-0.5 rounded-md">
+                 تعداد اقلام ممیزی شده: <span className="font-mono">{stats.totalItems}</span> ماده فعال یا نمونه
+               </span>
+             </div>
+ 
+             <div className="overflow-x-auto">
+               <table className="w-full text-right divide-y divide-border">
+                 <thead className="bg-muted/50 text-2xs sm:text-2xs font-bold text-muted-foreground uppercase tracking-wider border-b border-border">
+                   <tr>
+                     <th className="px-3 sm:px-4 py-3 text-right">ماده</th>
+                     <th className="px-3 sm:px-4 py-3 text-center">CAS No.</th>
+                     <th className="px-3 sm:px-4 py-3 text-center">وضعیت</th>
+                     <th className="px-3 sm:px-4 py-3 text-center">عملیات</th>
+                   </tr>
+                 </thead>
+                 <tbody className="divide-y divide-border text-xs sm:text-sm">
+                   {activeSupplier.vendors.map((v) => {
+                     const matchedCat = categoryLabels[v.category as keyof typeof categoryLabels] || { fa: v.category, icon: Globe };
+                     const CatIcon = matchedCat.icon;
+ 
+                     return (
+                       <tr key={v.id} className="hover:bg-accent/80 transition-colors">
+                         <td className="px-3 sm:px-4 py-2.5">
+                           <div className="flex items-center gap-2">
+                             <div className="bg-muted border border-border text-muted-foreground p-1.5 rounded-lg shrink-0">
+                               <CatIcon className="w-3.5 h-3.5" />
+                             </div>
+                             <div className="min-w-0">
+                               <div className="font-bold text-foreground text-2xs whitespace-nowrap" title={v.material}>{v.material || 'N/A'}</div>
+                               <div className="text-muted-foreground text-2xs font-mono mt-0.5 whitespace-nowrap" dir="ltr" style={{ textAlign: 'right' }} title={v.materialEn}>{v.materialEn || 'N/A'}</div>
+                             </div>
+                           </div>
+                         </td>
+                         <td className="px-3 sm:px-4 py-2.5 text-center whitespace-nowrap">
+                           <div className="inline-block text-right">
+                             {v.cas && (
+                                <div className="text-2xs sm:text-xs font-medium text-muted-foreground bg-muted px-1.5 py-0.5 rounded border border-border/50 inline-block font-mono" dir="ltr">
+                                  <span className="text-muted-foreground font-sans font-bold text-2xs mr-1">CAS No.:</span>
+                                  <span>{v.cas}</span>
+                                </div>
+                              )}
+                             {v.isSample && (
+                               <div className="text-2xs text-primary bg-primary/10 border border-primary/20 px-1.5 py-0.5 rounded font-bold mt-1 block">
+                                 نمونه ارزیابی اولیه / سمپل
+                               </div>
+                             )}
+                           </div>
+                         </td>
+                         <td className="px-3 sm:px-4 py-2.5 text-center">
+                           {/*
+                             * A sample carries the label its own test gave it,
+                             * not a source grade: departments do not score a
+                             * sample and risk is not assessed for one, so a
+                             * grade badge here would show a verdict nobody
+                             * reached (the same reason the sample category
+                             * dropped its score and risk columns).
+                             */}
+                           {isSampleRecord(v) ? (
+                             <Badge variant={describeSampleStatus(v).variant} className="text-2xs font-bold px-2 py-0">
+                               {describeSampleStatus(v).label}
+                             </Badge>
+                           ) : (
+                             <GradeBadge vendor={v} />
+                           )}
+                         </td>
+                         <td className="px-3 sm:px-4 py-2.5 text-center whitespace-nowrap">
+                           <Button
+                             type="button"
+                             variant="ghost"
+                             size="sm"
+                             onClick={() => onSelectVendor(v)}
+                             className="text-primary hover:text-primary bg-primary/10 hover:bg-primary/20 border border-primary/20 font-bold"
+                           >
+                             <Pencil />
+                             <span>پرونده ممیزی</span>
+                           </Button>
+                         </td>
+                       </tr>
+                     );
+                   })}
+                 </tbody>
+               </table>
+             </div>
+           </div>
+ 
+           {/* Multi-Dimensional Audit Score Breakdown (CSS Infographics Column Charts) */}
+           <div className="bg-card border border-border rounded-2xl p-6 shadow-sm">
+             <h3 className="text-sm text-foreground font-bold mb-6 flex items-center justify-start gap-2.5">
+               <span>شاخص میانگین عملکرد تفکیک شده دپارتمانی (Departmental Performance)</span>
+               <div className="w-1.5 h-1.5 bg-primary rounded-full animate-ping" />
+             </h3>
+ 
+             <div className={`grid grid-cols-1 ${myDepartments.length > 1 ? 'md:grid-cols-4' : 'max-w-md mx-auto'} gap-6`}>
+               {[
+                 { id: 'commercial', name: 'بازرگانی', avg: stats.deptAverages.commercial, icon: Briefcase, color: 'bg-primary' },
+                 { id: 'qa', name: 'کیفیت', avg: stats.deptAverages.qa, icon: Microscope, color: 'bg-emerald-600' },
+                 { id: 'planning', name: 'برنامه‌ریزی و انبار', avg: stats.deptAverages.planning, icon: Warehouse, color: 'bg-violet-600' },
+                 { id: 'finance', name: 'مالی', avg: stats.deptAverages.finance, icon: Coins, color: 'bg-amber-600' }
+               ].filter(dept => canScoreDepartment(currentUser, dept.id)).map((dept) => (
+                 <div key={dept.id} className="bg-muted border border-border rounded-xl p-4 flex flex-col justify-between hover:shadow-md hover:border-border transition-all">
+                   <div>
+                     <div className="flex items-center justify-between text-foreground font-bold text-sm mb-4">
+                       <div className="flex items-center gap-2">
+                         <dept.icon className="w-4 h-4 text-muted-foreground" />
+                         <span>{dept.name}</span>
+                       </div>
+                       <span className={`text-sm font-bold font-mono ${getScoreColorClass(dept.avg)}`}>{dept.avg} / 100</span>
+                     </div>
+                   </div>
+
+                   <div>
+                     <div className="w-full bg-muted h-2 rounded-full overflow-hidden">
+                       <div className={`${getScoreColorClass(dept.avg, true)} h-full rounded-full transition-all`} style={{ width: `${dept.avg}%` }} />
+                     </div>
+                   </div>
+                 </div>
+               ))}
+             </div>
+           </div>
+ 
+
+ 
+         </div>
+       ) : (
+         /* GLOBAL SEARCH & DISCOVERY DIRECTORY OF ALL UNIQUE SUPPLIERS */
+         <div className="space-y-6">
+           {/* The counters every other repository opens with. */}
+           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+             {[
+               { label: 'کل تأمین‌کنندگان', hint: 'Total Suppliers', value: directoryStats.total, icon: Building2,
+                 tone: 'bg-muted text-foreground border-border' },
+               { label: 'تولیدکنندگان', hint: 'Manufacturers', value: directoryStats.manufacturers, icon: Factory,
+                 tone: 'bg-indigo-50 text-indigo-600 border-indigo-100 dark:bg-indigo-950/50 dark:text-indigo-300 dark:border-indigo-900' },
+               { label: 'فروشندگان', hint: 'Suppliers', value: directoryStats.suppliers, icon: Handshake,
+                 tone: 'bg-emerald-50 text-emerald-600 border-emerald-100 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-900' },
+               // «—» rather than a zero: no company scored yet is not an average
+               // of zero, and an audit overview must not invent one.
+               { label: 'میانگین امتیاز ممیزی', hint: 'Average Audit Score', value: directoryStats.averageScore ?? '—', icon: Award,
+                 tone: 'bg-primary/10 text-primary border-primary/20' },
+               { label: 'بدون امتیاز ثبت‌شده', hint: 'Not Yet Scored', value: directoryStats.unscored, icon: AlertTriangle,
+                 tone: 'bg-amber-50 text-amber-600 border-amber-100 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-900' },
+             ].map(card => (
+               <StatTile key={card.hint} {...card} hintDir="ltr" loading={isLoading} />
+             ))}
+           </div>
+
+           {/* The search field every other repository uses.
+
+               It was a bare `<input>` with hand-written classes inside a
+               frosted panel — its own placeholder colour, its own focus ring in
+               a colour found nowhere else, and no shared focus treatment. The
+               icon and the clear button stay inline (the design system allows
+               those inside a field); the field itself is `ui/input`, so its
+               height, radius and focus ring are the same ones the material and
+               partner repositories draw. */}
+           <div className="bg-card border border-border rounded-2xl p-4 shadow-xs flex flex-col md:flex-row md:items-center gap-3">
+             <div className="relative flex-1 min-w-0">
+               <span className="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-muted-foreground">
+                 <Search className="w-4 h-4" />
+               </span>
+               <Input
+                 type="text"
+                 value={searchQuery}
+                 onChange={(e) => setSearchQuery(e.target.value)}
+                 placeholder="نام تامین‌کننده، نام دارو، کد CAS یا کشور را جستجو کنید…"
+                 className="pr-10 pl-10 w-full"
+                 aria-label="جستجوی تامین‌کننده"
+               />
+               {searchQuery && (
+                 <button
+                   type="button"
+                   onClick={() => setSearchQuery('')}
+                   aria-label="پاک کردن جستجو"
+                   className="absolute inset-y-0 left-0 flex items-center pl-3 text-muted-foreground hover:text-foreground transition-colors"
+                 >
+                   <X className="w-4 h-4" />
+                 </button>
+               )}
+             </div>
+           </div>
+
+           {/* The directory as a table.
+
+               It was a three-column grid of cards, which is the one list shape
+               the rest of the application does not use: the material, partner
+               and user repositories are all tables with a sortable header, a
+               shared empty row and skeleton rows while loading. Cards also
+               could not be ordered at all, so finding the lowest-scoring
+               company meant reading every card.
+
+               Nothing was dropped in the move: the role icon, the country, the
+               materials and the average score are all here, and the materials
+               column still names the first few and counts the rest. */}
+           <div className="bg-card border border-border rounded-2xl overflow-hidden shadow-xs">
+             <div className="overflow-x-auto">
+               <table className="w-full text-xs text-right" aria-busy={isLoading}>
+                 <caption className="sr-only">فهرست تأمین‌کنندگان با امکان مرتب‌سازی بر اساس هر ستون</caption>
+                 <thead>
+                   <tr className="bg-muted text-muted-foreground border-b border-border">
+                     <SortHeader field="name" label="تأمین‌کننده" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} />
+                     <SortHeader field="role" label="نقش" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} />
+                     <SortHeader field="country" label="کشور" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} />
+                     <SortHeader field="materials" label="مواد عرضه‌شده" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} />
+                     <SortHeader field="score" label={myDepartments.length === 1 ? 'میانگین امتیاز واحد شما' : 'میانگین امتیاز ممیزی'} sortField={sortField} sortOrder={sortOrder} onSort={handleSort} center />
+                     <th scope="col" className="py-3.5 px-4 font-bold text-center w-32">پرونده</th>
+                   </tr>
+                 </thead>
+                 <tbody>
+                   {isLoading ? (
+                     <TableSkeletonRows
+                       rows={6}
+                       columns={6}
+                       barClassName="h-3"
+                       rowClassName="border-b border-border/60 last:border-0"
+                       width={(c, i) => (c === 5 ? '5rem' : `${55 + ((i + c) % 3) * 15}%`)}
+                     />
+                   ) : sortedSuppliers.length === 0 ? (
+                     searchQuery ? (
+                       <TableEmptyRow
+                         colSpan={6}
+                         icon={Building}
+                         message="هیچ تأمین‌کننده‌ای با این جست‌وجو پیدا نشد."
+                         action={
+                           <Button type="button" variant="outline" size="sm" onClick={() => setSearchQuery('')} className="font-bold">
+                             پاک کردن جستجو
+                           </Button>
+                         }
+                         note="نام فارسی یا لاتین شرکت، نام ماده، کد CAS یا کشور را امتحان کنید."
+                       />
+                     ) : (
+                       <TableEmptyRow
+                         colSpan={6}
+                         icon={Building}
+                         message="هنوز سورسی در سامانه ثبت نشده است."
+                         note="این فهرست از روی سورس‌های ثبت‌شده ساخته می‌شود؛ با ثبت اولین سورس، شرکت آن اینجا می‌آید."
+                       />
+                     )
+                   ) : (
+                     paginatedSuppliers.map(supplier => {
+                       const avgScore = averageScoreOf(supplier);
+                       const shown = supplier.sources.slice(0, 2);
+                       const rest = supplier.sources.length - shown.length;
+                       return (
+                         <tr
+                           key={supplier.key}
+                           tabIndex={0}
+                           aria-label={`بررسی ممیزی ${supplier.name}`}
+                           onClick={() => setSelectedSupplierKey(supplier.key)}
+                           onKeyDown={event => {
+                             if (event.key === 'Enter' || event.key === ' ') {
+                               event.preventDefault();
+                               setSelectedSupplierKey(supplier.key);
+                             }
+                           }}
+                           className="border-b border-border/60 last:border-0 hover:bg-accent/60 transition-colors cursor-pointer group focus-visible:outline-none focus-visible:bg-accent"
+                         >
+                           <td className="py-3 px-4">
+                             <EntityName name={supplier.name} lines={2} className="font-bold text-foreground group-hover:text-primary transition-colors" />
+                             {supplier.nameEn && (
+                               <span className="block text-2xs font-mono text-muted-foreground mt-0.5" dir="ltr" style={{ textAlign: 'right' }}>
+                                 {supplier.nameEn}
+                               </span>
+                             )}
+                           </td>
+                           <td className="py-3 px-4">
+                             <span className="inline-flex items-center gap-1.5 text-2xs font-bold text-foreground" title={ROLE_LABEL[supplier.role]}>
+                               <span className="bg-primary/10 border border-primary/20 text-primary p-1 rounded-md shrink-0">
+                                 {React.createElement(roleIcon(supplier.role), { className: 'w-3.5 h-3.5' })}
+                               </span>
+                               {ROLE_LABEL[supplier.role]}
+                             </span>
+                           </td>
+                           <td className="py-3 px-4">
+                             {supplier.country ? (
+                               <span className="font-mono text-2xs text-muted-foreground font-semibold bg-muted px-2 py-0.5 rounded border border-border inline-block max-w-[150px] truncate" title={supplier.country}>
+                                 {supplier.country}
+                               </span>
+                             ) : (
+                               <span className="text-muted-foreground/50">—</span>
+                             )}
+                           </td>
+                           <td className="py-3 px-4">
+                             <div className="flex flex-wrap items-center gap-1 max-w-[22rem]">
+                               <span className="shrink-0 text-2xs font-mono font-bold text-primary bg-primary/10 border border-primary/20 px-1.5 py-0.5 rounded-md">
+                                 {supplier.sources.length.toLocaleString('fa-IR')}
+                               </span>
+                               {shown.map(v => (
+                                 <EntityName
+                                   key={v.id}
+                                   name={v.material}
+                                   lines={1}
+                                   className="text-2xs bg-muted text-muted-foreground px-2 py-0.5 rounded border border-border font-medium max-w-[150px]"
+                                 />
+                               ))}
+                               {rest > 0 && (
+                                 <span className="shrink-0 text-2xs bg-foreground text-background px-1.5 py-0.5 rounded font-bold font-mono">
+                                   +{rest.toLocaleString('fa-IR')}
+                                 </span>
+                               )}
+                             </div>
+                           </td>
+                           <td className="py-3 px-4 text-center">
+                             {/* "Not scored" is not zero, and the table says so
+                                 rather than printing a number nobody entered. */}
+                             {avgScore !== null ? (
+                               <span className={`text-xs font-bold font-mono ${getScoreColorClass(avgScore)}`}>{avgScore}%</span>
+                             ) : (
+                               <span className="text-2xs text-muted-foreground">ارزیابی نشده</span>
+                             )}
+                           </td>
+                           <td className="py-3 px-4 text-center">
+                             <span className="inline-flex items-center gap-1 text-2xs font-bold text-primary font-mono">
+                               بررسی ممیزی
+                               <ChevronLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
+                             </span>
+                           </td>
+                         </tr>
+                       );
+                     })
+                   )}
+                 </tbody>
+               </table>
+             </div>
+           </div>
+
+           <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+             <PerPageSelect value={perPage} onChange={n => setPerPage(n)} />
+             <div className="flex-1 min-w-0">
+               <Pagination
+                 currentPage={page}
+                 totalPages={totalPages}
+                 totalItems={totalItems}
+                 startIndex={startIndex}
+                 endIndex={endIndex}
+                 onPageChange={setCurrentPage}
+               />
+             </div>
+           </div>
+         </div>
+       )}
+     </div>
+   );
+ }

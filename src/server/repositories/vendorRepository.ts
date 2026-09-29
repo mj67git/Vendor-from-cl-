@@ -1,0 +1,745 @@
+import { lockRecordWrite, serializeWrites } from "../http/recordLock.js";
+import type { Prisma } from "@prisma/client";
+import { resolvePartnerLink, stripPartnerMarker } from "../domain/partnerLink.js";
+import { parseDateSafely } from "../db/coerce.js";
+import { requirePrisma } from "../db/prisma.js";
+import { generateMaterialId } from "../domain/materialId.js";
+import { normalizeSourceGrade } from "../../utils/sourceVocabulary.js";
+import {
+  CALCULATION_WEIGHTS,
+  calculateRoundedWeightedScore,
+} from "../domain/vendorEvaluation.js";
+
+/**
+ * Everything that reads or writes a source.
+ *
+ * A "source" is one company offering one material — the central aggregate of
+ * this system — and it lives across six tables. These functions are the only
+ * place that knows how to assemble one from those tables and take one apart
+ * again, which is why they belong together and away from the routing.
+ *
+ * Moved out of server.ts unchanged. One thing to keep in view while reading:
+ * every write here is a read-modify-write of the whole aggregate, so the
+ * ordering rules — `lockVendorWrite` and the `expectedUpdatedAt` precondition
+ * in `saveVendorToDb` — are load-bearing, not decoration.
+ */
+
+
+// --- Mapping helpers between the frontend shapes and the normalized enums ---
+
+const DECISION_TO_DB: Record<string, "Pass" | "Reject" | "ApprovedConditional"> = {
+  "Pass": "Pass",
+  "Reject": "Reject",
+  "Approved Conditional": "ApprovedConditional",
+};
+const DECISION_FROM_DB: Record<string, string> = {
+  "Pass": "Pass",
+  "Reject": "Reject",
+  "ApprovedConditional": "Approved Conditional",
+};
+const DEVIATION_VALUES = ["None", "NCR", "Deviation", "OOS", "CAPA", "OOT", "Complaint", "Other"];
+const RISK_LEVELS = ["Low", "Medium", "High"];
+
+export function toDbDecision(d: any): "Pass" | "Reject" | "ApprovedConditional" {
+  return DECISION_TO_DB[d] ?? "Pass";
+}
+export function fromDbDecision(d: any): string {
+  return DECISION_FROM_DB[d] ?? "Pass";
+}
+export function toDbDeviation(r: any): any {
+  return DEVIATION_VALUES.includes(r) ? r : "None";
+}
+export function toDbRiskLevel(l: any): any {
+  return RISK_LEVELS.includes(l) ? l : "Low";
+}
+
+// Persist a vendor's risk assessment (single row per vendor), analysis records
+// and activity logs into their normalized tables. Each collection is fully
+// replaced from the passed data so the read-modify-write endpoints stay
+// consistent. A field left undefined is not touched (partial saves).
+// `TransactionClient`, not `PrismaClient`: `saveVendorToDb` calls this from
+// inside `$transaction`, and the delete-then-recreate below is exactly the part
+// that must not be able to half-finish. A full client is still accepted — it is
+// the wider type — so the other callers are unaffected.
+export async function persistVendorRelations(prisma: Prisma.TransactionClient, id: string, v: any): Promise<void> {
+  const { riskAssessment, analysisRecords, activityLogs } = v;
+
+  if (riskAssessment !== undefined) {
+    await prisma.riskAssessment.deleteMany({ where: { vendorId: id } });
+    if (riskAssessment) {
+      await prisma.riskAssessment.create({
+        data: {
+          vendorId: id,
+          materialCriticality: Number(riskAssessment.materialCriticality) || 0,
+          detectability: Number(riskAssessment.detectability) || 0,
+          probability: Number(riskAssessment.probability) || 0,
+          sps: Number(riskAssessment.sps) || 0,
+          riskScore: Number(riskAssessment.riskScore) || 0,
+          sri: Number(riskAssessment.sri) || 0,
+          riskLevel: toDbRiskLevel(riskAssessment.riskLevel),
+          evaluationDate: riskAssessment.date || null,
+          evaluator: riskAssessment.evaluator || null,
+        },
+      });
+    }
+  }
+
+  if (analysisRecords !== undefined && Array.isArray(analysisRecords)) {
+    await prisma.analysisRecord.deleteMany({ where: { vendorId: id } });
+    for (const rec of analysisRecords) {
+      await prisma.analysisRecord.create({
+        data: {
+          id: rec.id || crypto.randomUUID(),
+          vendorId: id,
+          recordDate: rec.date || null,
+          qcCode: rec.qcCode || null,
+          decision: toDbDecision(rec.decision),
+          deviationReason: toDbDeviation(rec.deviationReason),
+          comments: rec.comments || null,
+          recordedBy: rec.recordedBy || null,
+        },
+      });
+    }
+  }
+
+  if (activityLogs !== undefined && Array.isArray(activityLogs)) {
+    await prisma.activityLog.deleteMany({ where: { vendorId: id } });
+    for (const log of activityLogs) {
+      await prisma.activityLog.create({
+        data: {
+          id: log.id || crypto.randomUUID(),
+          vendorId: id,
+          action: log.action || log.details || "بروزرسانی اطلاعات",
+          user: log.user || "کاربر سیستم",
+          createdAt: log.date ? parseDateSafely(log.date) : new Date(),
+        },
+      });
+    }
+  }
+}
+
+// --- Business Partner (Manufacturer / Supplier) mapping & persistence ---
+
+
+/**
+ * Build the vendor objects the API serves.
+ *
+ * Pass `vendorId` to build just one — or an array of ids to build those. Without it every query below runs
+ * unfiltered, which is correct for the list endpoint and ruinous for the
+ * sixteen handlers that only ever wanted a single record: fetching one vendor
+ * used to mean loading every vendor, every evaluation, every activity log and
+ * every analysis result, then discarding all but one. The `where` clauses use
+ * indexes that already exist on the schema.
+ *
+ * Pass `window` to build one page of the list. The page is taken from the
+ * vendor table first and every relation is then scoped to the ids on that page,
+ * so asking for 200 sources costs 200 sources' worth of work — not the whole
+ * table's, minus the rows thrown away afterwards.
+ *
+ * The order is fixed (name, then id as the tie-break) and applied whether or
+ * not a page was asked for. Without it Postgres may return rows in any order it
+ * likes, which is harmless for one response and fatal across several: pages
+ * would overlap and skip, so a client assembling them would show some sources
+ * twice and lose others entirely. The tie-break matters because names are not
+ * unique — two rows sharing a name have no defined order without it.
+ */
+export interface VendorPage {
+  skip: number;
+  take: number;
+}
+
+/** How many sources exist, so a paging client knows when it has them all. */
+export async function countVendors(): Promise<number> {
+  return requirePrisma().vendor.count();
+}
+
+/**
+ * Which sources changed since a moment, and how many exist now.
+ *
+ * The client holds the whole register in memory and, until this existed, only
+ * ever re-read it on a failed write — so a second operator worked from the
+ * snapshot they logged in with and never saw anybody else's edits without
+ * pressing reload. This is the cheap question a poll can ask every half minute:
+ * two indexed reads, ids and timestamps only, no vendor bodies.
+ *
+ * `total` covers what `updatedAt` cannot. A deleted row leaves no timestamp
+ * behind, so a caller whose count no longer matches knows to re-read the list
+ * even when nothing came back as changed.
+ *
+ * `take` is capped because the answer is a signal, not a payload: a caller that
+ * has been away long enough to miss more than this needs a full re-read anyway,
+ * which `total` and the sheer size of the list already tell it.
+ */
+export async function getVendorChangesSince(
+  since: Date | null,
+): Promise<{ changed: { id: string; updatedAt: string }[]; total: number }> {
+  const prisma = requirePrisma();
+  const [rows, total] = await Promise.all([
+    since
+      ? prisma.vendor.findMany({
+          where: { updatedAt: { gt: since } },
+          select: { id: true, updatedAt: true },
+          orderBy: { updatedAt: "asc" },
+          take: 500,
+        })
+      : Promise.resolve([] as { id: string; updatedAt: Date }[]),
+    prisma.vendor.count(),
+  ]);
+  return {
+    changed: rows.map(r => ({ id: r.id, updatedAt: r.updatedAt.toISOString() })),
+    total,
+  };
+}
+
+export async function getVendorsList(
+  vendorId?: string | string[],
+  window?: VendorPage,
+): Promise<any[]> {
+  const prisma = requirePrisma();
+  {
+    /*
+     * One source, a named handful, or the register.
+     *
+     * The handful is what the background poll asks for. It used to have no way
+     * to ask: `GET /api/vendors/changes` answered with the ids that moved, and
+     * the client then re-read *everything* — nine megabytes on a register of
+     * ten thousand sources, every thirty seconds for as long as a second
+     * operator kept saving. The ids were already in hand; only the endpoint to
+     * spend them on was missing.
+     */
+    const idFilter = Array.isArray(vendorId)
+      ? { id: { in: vendorId } }
+      : vendorId ? { id: vendorId } : {};
+    const vendors = await prisma.vendor.findMany({
+      where: idFilter,
+      orderBy: [{ name: "asc" }, { id: "asc" }],
+      ...(window ? { skip: window.skip, take: window.take } : {}),
+    });
+
+    // Scope every relation query to what this call is actually building. An
+    // empty `where` is a no-op, so the unpaged full list still reads each table
+    // once; a page reads only its own rows. `in` over a page of ids is what the
+    // primary-key index is for — over the whole table it would be worse than no
+    // filter at all, hence the three-way choice rather than always listing ids.
+    const only: any = Array.isArray(vendorId)
+      ? { vendorId: { in: vendorId } }
+      : vendorId
+        ? { vendorId }
+        : window
+          ? { vendorId: { in: vendors.map(v => v.id) } }
+          : {};
+    const vendorMaterials = await prisma.vendorMaterial.findMany({ where: only });
+    // Materials are reached through the links above, so when building a single
+    // vendor — or one page — only the ones actually referenced need loading.
+    const materialIds = [...new Set(vendorMaterials.map(vm => vm.materialId).filter(Boolean))] as string[];
+    // Only the five fields a source needs from the catalogue. Selecting the
+    // whole row also fetched `specification_file_data` — the base64 of every
+    // material's specification PDF — for every material referenced by the list,
+    // read out of the database and across the wire on every single request, to
+    // build a payload that has never carried it.
+    const materials = await prisma.material.findMany({
+      where: vendorId || window ? { id: { in: materialIds } } : {},
+      select: { id: true, name: true, nameEn: true, cas: true, irc: true },
+    });
+    // Newest first, explicitly. Without an order the database returns rows in
+    // whatever physical order it likes — which an UPDATE or a VACUUM can change
+    // — and the map below keeps the last one it sees, so a source with more
+    // than one evaluation answered differently from one request to the next.
+    const evaluations = await prisma.evaluation.findMany({
+      where: only,
+      orderBy: { createdAt: "desc" },
+    });
+    const activityLogRows = await prisma.activityLog.findMany({ where: only, orderBy: { createdAt: "asc" } });
+    const riskRows = await prisma.riskAssessment.findMany({ where: only });
+    const analysisRows = await prisma.analysisRecord.findMany({ where: only, orderBy: { createdAt: "asc" } });
+
+    const materialsMap = new Map<string, any>(materials.map(m => [m.id, m]));
+    // Which material each source currently supplies. Built here because the
+    // evaluation map below picks the row that matches it.
+    const linkByVendor = new Map<string, any>();
+    for (const vm of vendorMaterials) {
+      if (!linkByVendor.has(vm.vendorId)) linkByVendor.set(vm.vendorId, vm);
+    }
+
+    /**
+     * One evaluation per source, chosen rather than stumbled upon.
+     *
+     * The row for the material the source currently supplies is the right one;
+     * the newest is the fallback for a record whose link is missing. Building
+     * the map from `evaluations.map(...)` kept whichever row came last in an
+     * unordered result, which is how the same source reported two different
+     * scores.
+     */
+    const evaluationsMap = new Map<string, any>();
+    for (const ev of evaluations) {
+      const current = evaluationsMap.get(ev.vendorId);
+      const link = linkByVendor.get(ev.vendorId);
+      if (!current) { evaluationsMap.set(ev.vendorId, ev); continue; }
+      if (link && ev.materialId === link.materialId) evaluationsMap.set(ev.vendorId, ev);
+    }
+
+    const logsByVendor = new Map<string, any[]>();
+    activityLogRows.forEach(log => {
+      const existing = logsByVendor.get(log.vendorId) || [];
+      existing.push({
+        id: log.id,
+        action: log.action,
+        date: log.createdAt.toISOString(),
+        user: log.user
+      });
+      logsByVendor.set(log.vendorId, existing);
+    });
+
+    const riskByVendor = new Map<string, any>();
+    riskRows.forEach(r => {
+      riskByVendor.set(r.vendorId, {
+        materialCriticality: r.materialCriticality,
+        detectability: r.detectability,
+        probability: r.probability,
+        sps: r.sps,
+        riskScore: r.riskScore,
+        sri: r.sri,
+        riskLevel: r.riskLevel,
+        date: r.evaluationDate || "",
+        evaluator: r.evaluator || ""
+      });
+    });
+
+    const analysisByVendor = new Map<string, any[]>();
+    analysisRows.forEach(a => {
+      const existing = analysisByVendor.get(a.vendorId) || [];
+      existing.push({
+        id: a.id,
+        date: a.recordDate || "",
+        qcCode: a.qcCode || "",
+        decision: fromDbDecision(a.decision),
+        deviationReason: a.deviationReason,
+        comments: a.comments || "",
+        recordedBy: a.recordedBy || ""
+      });
+      analysisByVendor.set(a.vendorId, existing);
+    });
+
+    // Indexed by vendor rather than scanned per vendor: the previous .find()
+    // inside this loop made the list endpoint O(n²) — at 1,200 vendors that is
+    // over a million comparisons for a single request.
+
+    const result: any[] = [];
+    for (const v of vendors) {
+      const link = linkByVendor.get(v.id);
+      const materialObj = link ? materialsMap.get(link.materialId) : null;
+      const evalObj = evaluationsMap.get(v.id);
+
+      let scoreObj = null;
+      let rawScoresObj = null;
+      let rejectionReasonsObj = null;
+
+      if (evalObj) {
+        try { scoreObj = evalObj.scores ? JSON.parse(evalObj.scores) : null; } catch {}
+        try { rawScoresObj = evalObj.rawScores ? JSON.parse(evalObj.rawScores) : null; } catch {}
+        try { rejectionReasonsObj = evalObj.rejectionReasons ? JSON.parse(evalObj.rejectionReasons) : null; } catch {}
+        
+        if (!scoreObj) {
+          scoreObj = {
+            commercial: evalObj.commercialScore,
+            qa: evalObj.qaScore,
+            planning: evalObj.planningScore,
+            finance: evalObj.financeScore
+          };
+        }
+      }
+
+      const riskObj = riskByVendor.get(v.id) || null;
+      const analysisArr: any[] = analysisByVendor.get(v.id) || [];
+
+      // The column wins; the marker inside contact_info is only a fallback for
+      // rows written before the link had columns (see domain/partnerLink).
+      const { contactInfo, manufacturerId, supplierId } = resolvePartnerLink(
+        { manufacturerId: (v as any).manufacturerId, supplierId: (v as any).supplierId },
+        v.contactInfo,
+      );
+
+      result.push({
+        id: v.id,
+        name: v.name,
+        nameEn: v.nameEn,
+        country: v.country,
+        contactInfo: contactInfo,
+        manufacturerId,
+        supplierId,
+        registrationDate: v.registrationDate || "",
+        // Carried so a handler can hand it back as the precondition for its
+        // write; the client never needs to look at it.
+        updatedAt: (v as any).updatedAt ?? null,
+        status: v.status,
+        grade: v.grade,
+        initialSampleStatus: (v as any).initialSampleStatus || "",
+        rejectedByDecision: (v as any).rejectedByDecision === true,
+        // The edit form validates against materialId, so it has to travel with
+        // the vendor — without it every existing source failed validation with
+        // "choose a material" even though one was linked.
+        materialId: link ? link.materialId : null,
+        material: materialObj ? materialObj.name : "نامشخص",
+        materialEn: materialObj ? materialObj.nameEn : "Unknown",
+        cas: materialObj ? materialObj.cas : "N/A",
+        // IRC lives on the source. Rows written before that column existed only
+        // have it on their material, so fall back there rather than blanking a
+        // licence number that is really on file.
+        irc: (v as any).irc ?? (materialObj ? materialObj.irc : "N/A"),
+        // The source's own licence expiry, which is written by PATCH /contact
+        // and audited on change but was never read back out. Everything that
+        // reads it — the dashboard's expiring-licence card, the detail page,
+        // the supplier overview — therefore saw nothing, so the feature looked
+        // implemented and always reported zero.
+        ircExpiryDate: v.ircExpiryDate ?? null,
+        isSample: link ? link.isSample : false,
+        category: link ? link.category : "foreign",
+        scores: scoreObj,
+        rawScores: rawScoresObj,
+        rejectionReasons: rejectionReasonsObj,
+        activityLogs: logsByVendor.get(v.id) || [],
+        analysisRecords: analysisArr,
+        riskAssessment: riskObj,
+        // The licence issue date, from its own column. It used to be hardcoded
+        // to "" here, so the source page fell back to the registration date and
+        // printed that under «تاریخ صدور».
+        lastAudit: (v as any).lastAudit ?? ""
+      });
+    }
+    return result;
+  }
+}
+
+export async function getVendorById(id: string): Promise<any> {
+  const list = await getVendorsList(id);
+  return list[0] || null;
+}
+
+/**
+ * Serialise the mutating requests that touch one source.
+ *
+ * The mechanism — and the measurement that made it necessary — lives in
+ * `http/recordLock.ts`, because partners, materials and the chosen-source
+ * decision have the same read-modify-write shape and needed the same
+ * protection. This is the source module's binding of it, kept under its old
+ * name so the seven routes that carry it read unchanged.
+ */
+export const serializeVendorWrites = serializeWrites("vendor");
+
+export function lockVendorWrite(id: string): Promise<() => void> {
+  return lockRecordWrite("vendor", id);
+}
+
+/**
+ * Another writer changed this source between the read and the write.
+ *
+ * The endpoints all do a read-modify-write, so two overlapping requests make
+ * the slower one write back its stale copy — which is how a deleted laboratory
+ * result used to come back after a reload. The per-vendor in-process lock stops
+ * that inside one Node process; this is what stops it when there is more than
+ * one, which the serverless deployment always has and a second container would.
+ */
+export class VendorConflictError extends Error {
+  constructor() {
+    super('این رکورد هم‌زمان توسط شخص دیگری تغییر کرده است. صفحه را تازه کنید و دوباره تلاش کنید.');
+    this.name = 'VendorConflictError';
+  }
+}
+
+export async function saveVendorToDb(
+  v: any,
+  /**
+   * The `updatedAt` the caller read before it started modifying. When given,
+   * the write only lands if the row still carries that value; otherwise it is
+   * refused rather than silently overwriting the other writer's work. Callers
+   * that legitimately write without a prior read (the create path) omit it.
+   */
+  expectedUpdatedAt?: Date | null,
+): Promise<boolean> {
+  const prisma = requirePrisma();
+  /*
+   * One save, one transaction.
+   *
+   * A source lives across six tables and this function wrote to them one
+   * statement at a time, so anything that failed part-way — a constraint, a
+   * dropped connection, a timeout — left the aggregate in a state no one had
+   * ever asked for. The worst of it is below: the risk assessment, the
+   * laboratory results and the activity log are each *deleted and recreated*
+   * (`persistVendorRelations`), so a failure between those two halves does not
+   * merely lose the edit, it loses the records that were already there. The
+   * `expectedUpdatedAt` claim is inside the transaction too, so the check and
+   * the writes it guards cannot be separated by another writer.
+   *
+   * The timeout is stated rather than inherited: this is up to fifteen
+   * statements, and Prisma's default five seconds is a limit a source with a
+   * long analysis history can genuinely reach — at which point the rollback
+   * would look like data loss to the person saving.
+   */
+  return prisma.$transaction(async (tx) => {
+    const {
+      id, name, nameEn, country, contactInfo, registrationDate, status, grade,
+      material, materialEn, cas, irc, ircExpiryDate, lastAudit, isSample, category,
+      scores, rawScores, rejectionReasons,
+      manufacturerId, supplierId
+    } = v;
+
+    /*
+     * The partner link goes in its own columns.
+     *
+     * It used to be smuggled into `contact_info` as a `__BP_METAUI__:mfg:sup`
+     * marker while `manufacturer_id` and `supplier_id` — which exist, and are
+     * indexed — were never written at all. That produced three failures:
+     *
+     *   1. Reading prefers the column and falls back to the marker, so once a
+     *      column held anything, later changes to the link were invisible: the
+     *      write updated the marker and the read kept returning the stale
+     *      column. A source could show one company's name and stay linked to
+     *      another.
+     *   2. `DELETE /api/business-partners/:id` counts dependants with
+     *      `where: { supplierId: id }`. Against an always-NULL column that
+     *      count is always zero, so a partner in active use could be deleted
+     *      with the guard reporting nothing depends on it.
+     *   3. The marker sat inside a field the user edits by hand, so editing the
+     *      contact details could corrupt or drop the link.
+     *
+     * Old rows are migrated by 20260901120000_vendor_partner_columns; the read
+     * path keeps its marker fallback for anything that migration missed.
+     */
+    const serializedContactInfo = stripPartnerMarker(contactInfo);
+    const manufacturerLink = manufacturerId || null;
+    const supplierLink = supplierId || null;
+
+    // risk assessment & analysis records are now stored in normalized tables
+    // (see persistVendorRelations), not in the legacy vendor Text columns.
+    const scoreText = scores ? JSON.stringify(scores) : null;
+    const rawScoreText = rawScores ? JSON.stringify(rawScores) : null;
+    const rejectText = rejectionReasons ? JSON.stringify(rejectionReasons) : null;
+
+    const scoreObj = scores || { commercial: 0, qa: 0, planning: 0, finance: 0 };
+    const roundedTotal = calculateRoundedWeightedScore(scoreObj, CALCULATION_WEIGHTS);
+
+    if (expectedUpdatedAt) {
+      // updateMany takes a non-unique filter, so the timestamp can be part of
+      // the WHERE. A count of zero means the row moved under us — or vanished —
+      // and either way this write must not land.
+      const claimed = await tx.vendor.updateMany({
+        where: { id, updatedAt: expectedUpdatedAt },
+        data: { updatedAt: new Date() },
+      });
+      if (claimed.count === 0) throw new VendorConflictError();
+    }
+
+    await tx.vendor.upsert({
+      where: { id },
+      update: {
+        name: name || "Unknown",
+        nameEn: nameEn || "Unknown",
+        country: country || "نامشخص",
+        contactInfo: serializedContactInfo,
+        // Jalali, like every other date this application writes. The Gregorian
+        // ISO fallback that used to sit here meant a record saved without a
+        // registration date — a script, an import, any save that omitted the
+        // field — printed `2026-09-08` next to a record showing `۱۴۰۵/۰۶/۱۷`.
+        registrationDate: registrationDate || new Date().toLocaleDateString('fa-IR'),
+        status: status || "new",
+        grade: grade || null,
+        initialSampleStatus: v.initialSampleStatus || null,
+        // Rule 11b: a field the record carries has to be written in both
+        // branches, or it is accepted, acknowledged and silently dropped.
+        rejectedByDecision: (v as any).rejectedByDecision === true,
+        irc: irc || null,
+        /*
+         * The licence dates.
+         *
+         * Neither was written here. `irc_expiry_date` existed as a column and
+         * was read back on every load, and `PATCH /contact` carefully computed
+         * it, audited the change and handed it to this function — which dropped
+         * it. `last_audit` had no column at all. So the expiry date a person
+         * typed into the source form was accepted, acknowledged with a 200, and
+         * gone on the next read, which left every feature built on it — the
+         * dashboard's expiring-licence tile, the banner on the source page, the
+         * worklist, the valid/expired badge — permanently reporting nothing.
+         */
+        ircExpiryDate: ircExpiryDate || null,
+        lastAudit: lastAudit || null,
+        manufacturerId: manufacturerLink,
+        supplierId: supplierLink,
+      },
+      create: {
+        id,
+        name: name || "Unknown",
+        nameEn: nameEn || "Unknown",
+        country: country || "نامشخص",
+        contactInfo: serializedContactInfo,
+        // Jalali, like every other date this application writes. The Gregorian
+        // ISO fallback that used to sit here meant a record saved without a
+        // registration date — a script, an import, any save that omitted the
+        // field — printed `2026-09-08` next to a record showing `۱۴۰۵/۰۶/۱۷`.
+        registrationDate: registrationDate || new Date().toLocaleDateString('fa-IR'),
+        status: status || "new",
+        grade: grade || null,
+        initialSampleStatus: v.initialSampleStatus || null,
+        // Rule 11b: a field the record carries has to be written in both
+        // branches, or it is accepted, acknowledged and silently dropped.
+        rejectedByDecision: (v as any).rejectedByDecision === true,
+        irc: irc || null,
+        /*
+         * The licence dates.
+         *
+         * Neither was written here. `irc_expiry_date` existed as a column and
+         * was read back on every load, and `PATCH /contact` carefully computed
+         * it, audited the change and handed it to this function — which dropped
+         * it. `last_audit` had no column at all. So the expiry date a person
+         * typed into the source form was accepted, acknowledged with a 200, and
+         * gone on the next read, which left every feature built on it — the
+         * dashboard's expiring-licence tile, the banner on the source page, the
+         * worklist, the valid/expired badge — permanently reporting nothing.
+         */
+        ircExpiryDate: ircExpiryDate || null,
+        lastAudit: lastAudit || null,
+        manufacturerId: manufacturerLink,
+        supplierId: supplierLink,
+      },
+    });
+
+    /**
+     * Link to the material the form actually picked from the catalogue.
+     *
+     * The id used to be derived with `generateMaterialId(cas, irc, …)`, so the
+     * source's IRC became part of the material's identity: registering a source
+     * with an IRC minted a second material row for a substance already in the
+     * catalogue (`mat_<cas>_<irc>` beside the real `M-…`) and linked the source
+     * to that duplicate. Deriving is now only the fallback for legacy payloads
+     * that carry no materialId, and the IRC is no longer part of it.
+     */
+    const materialId = v.materialId || generateMaterialId(cas, undefined, material, materialEn);
+    const existingMaterial = await tx.material.findUnique({ where: { id: materialId } });
+    if (!existingMaterial) {
+      // Only ever create the catalogue entry from a vendor payload; never
+      // overwrite one, or saving a source would rewrite the master record.
+      await tx.material.create({
+        data: {
+          id: materialId,
+          name: material || "نامشخص",
+          nameEn: materialEn || "Unknown",
+          cas: cas || "N/A",
+          irc: "N/A",
+        },
+      });
+    }
+
+    // Delete any old links for this vendor that point to a different material
+    await tx.vendorMaterial.deleteMany({
+      where: {
+        vendorId: id,
+        materialId: { not: materialId }
+      }
+    });
+
+    // …and the evaluation that was keyed to it. The link was being cleaned up
+    // and the evaluation was not, so changing a source's material left a row
+    // scoring it against a material it no longer supplies — which is what gave
+    // the read two candidates to choose between in the first place.
+    await tx.evaluation.deleteMany({
+      where: {
+        vendorId: id,
+        materialId: { not: materialId }
+      }
+    });
+
+    /**
+     * Upsert on (vendorId, materialId), not on the synthetic `link_<v>_<m>` id.
+     *
+     * Links created outside this function (seeds, imports) carry their own ids,
+     * so keying the upsert on the synthetic one tried to *insert* a second row
+     * for a pair that already exists and hit the unique constraint. It stayed
+     * hidden only because the material id used to be derived from the payload,
+     * which made the deleteMany above drop the existing link first.
+     */
+    await tx.vendorMaterial.upsert({
+      where: { vendorId_materialId: { vendorId: id, materialId } },
+      update: {
+        isSample: isSample ?? false,
+        category: category || "foreign",
+      },
+      create: {
+        id: `link_${id}_${materialId}`,
+        vendorId: id,
+        materialId: materialId,
+        isSample: isSample ?? false,
+        category: category || "foreign",
+      },
+    });
+
+    const evalId = `eval_${id}_${materialId}`;
+    await tx.evaluation.upsert({
+      where: { id: evalId },
+      update: {
+        period: "۱۴۰۵-Q1",
+        commercialScore: scoreObj.commercial || 0,
+        qaScore: scoreObj.qa || 0,
+        planningScore: scoreObj.planning || 0,
+        financeScore: scoreObj.finance || 0,
+        totalScore: roundedTotal,
+        // The grade as one of the four bands, or nothing. `grade || "C"` stored
+        // a Grade C for every source nobody had scored — write-only, since the
+        // read path takes the grade from the vendor row, but a stored claim all
+        // the same (rule 11c: never persist a derived value you were handed).
+        grade: normalizeSourceGrade(grade),
+        scores: scoreText,
+        rawScores: rawScoreText,
+        rejectionReasons: rejectText,
+      },
+      create: {
+        id: evalId,
+        vendorId: id,
+        materialId: materialId,
+        period: "۱۴۰۵-Q1",
+        commercialScore: scoreObj.commercial || 0,
+        qaScore: scoreObj.qa || 0,
+        planningScore: scoreObj.planning || 0,
+        financeScore: scoreObj.finance || 0,
+        totalScore: roundedTotal,
+        // The grade as one of the four bands, or nothing. `grade || "C"` stored
+        // a Grade C for every source nobody had scored — write-only, since the
+        // read path takes the grade from the vendor row, but a stored claim all
+        // the same (rule 11c: never persist a derived value you were handed).
+        grade: normalizeSourceGrade(grade),
+        scores: scoreText,
+        rawScores: rawScoreText,
+        rejectionReasons: rejectText,
+      },
+    });
+
+    await persistVendorRelations(tx, id, v);
+
+    return true;
+  }, { timeout: 15_000 });
+}
+
+export async function deleteVendorFromDb(id: string): Promise<boolean> {
+  const prisma = requirePrisma();
+  try {
+    // Evaluations, vendor-material links, risk assessments, analysis records
+    // and activity logs cascade on the vendor delete via their foreign keys.
+    // The three statements are one transaction for the same reason the save is:
+    // a failure on the last of them used to leave a source stripped of its
+    // evaluation and its material link but still present in every register.
+    await prisma.$transaction(async (tx) => {
+      await tx.evaluation.deleteMany({ where: { vendorId: id } });
+      await tx.vendorMaterial.deleteMany({ where: { vendorId: id } });
+      await tx.vendor.delete({ where: { id } });
+    });
+    return true;
+  } catch (err: any) {
+    // Prisma throws P2025 when the target row does not exist.
+    if (err?.code === "P2025") {
+      return false;
+    }
+    throw err;
+  }
+}
+
+
+
+// Default users provisioned into PostgreSQL on first startup (empty users table).

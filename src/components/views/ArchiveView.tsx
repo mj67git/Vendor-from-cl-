@@ -1,0 +1,879 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Archive, ChevronDown, ClipboardList, Download, ExternalLink, FileText, ListChecks, Printer, Search, ShieldAlert, Star, X } from 'lucide-react';
+import { EntityName } from '../../components/EntityName';
+import { Badge } from '../../components/ui/badge';
+import { GradeBadge } from '../../components/GradeBadge';
+import { cn } from '../../lib/utils';
+import { Pagination } from '../../components/Pagination';
+import { PerPageSelect } from '../ui/per-page-select';
+import { Button } from '../../components/ui/button';
+import { Input, inputBaseClass } from '../../components/ui/input';
+import { PageTitle } from '../../components/ui/page-title';
+import { SortHeader } from '../../components/ui/sort-header';
+import { StatTile } from '../../components/ui/stat-tile';
+import { TableEmptyRow } from '../../components/ui/table-empty-row';
+import { TableSkeletonRows } from '../../components/ui/table-skeleton-rows';
+import { PrintableArchiveList, PrintableEvaluationForm } from '../../components/PrintableForms';
+import { categoryLabels } from '../../constants/categories';
+import { BusinessPartner, Material, User, Vendor } from '../../types';
+import { useExcelExport } from '../../hooks/useExcelExport';
+import { authFetch, isLocalMode } from '../../services/authFetch';
+import { describeSelection, selectionForVendor, type SourceSelectionRecord } from '../../utils/sourceSelection';
+import { can } from '../../utils/permissions';
+import { cleanPlaceholder } from '../../utils/vendorPartner';
+import { isInBlacklistCategory, isInCategoryRegister, isVendorRejected } from '../../utils/vendorState';
+import { describeSampleStatus, isSampleRecord } from '../../utils/sampleStatus';
+import { describeVendorRank } from '../../utils/vendorRank';
+import { getDisplayCountry } from '../../utils/vendorUtils';
+import { INITIAL_SOURCE_SELECTIONS } from '../../db_source_selections';
+
+// extracted from App.tsx
+
+/** The archive columns that can be ordered. */
+type ArchiveSortField = 'name' | 'material' | 'category' | 'country' | 'grade' | 'risk' | 'updated';
+
+/** Persian-aware ordering, the same collator the other tables use. */
+const archiveCollator = new Intl.Collator('fa', { numeric: true, sensitivity: 'base' });
+
+/** Risk levels in the order they matter, so "High" sorts above "Low". */
+const RISK_ORDER: Record<string, number> = { High: 3, Medium: 2, Low: 1 };
+
+/** Grades in rubric order; an unscored source sorts below every graded one. */
+const GRADE_ORDER: Record<string, number> = { A: 4, B: 3, C: 2, D: 1, rejected: 0, 'black list': 0 };
+
+const RISK_LABEL: Record<string, string> = { High: 'بالا', Medium: 'متوسط', Low: 'پایین' };
+
+/** The export menu's rows and its group headings, written once. */
+const exportItemClass =
+  'w-full text-right px-4 py-2 text-xs text-foreground hover:bg-accent hover:text-primary ' +
+  'font-medium transition-colors flex items-center gap-2';
+const exportHeadingClass =
+  'px-4 pt-1 pb-1.5 text-2xs font-bold text-muted-foreground tracking-wider select-none';
+
+export function ArchiveView({ vendors, currentUser, partners = [], materials = [], onSelectVendor, isLoading = false }: {
+  vendors: Vendor[],
+  currentUser: User,
+  partners?: BusinessPartner[],
+  materials?: Material[],
+  /** Open a source's own page. The archive could print a row but not open it. */
+  onSelectVendor?: (vendor: Vendor) => void,
+  /** True while the first load of the source list is still in flight. */
+  isLoading?: boolean,
+}) {
+  const [searchTerm, setSearchTerm] = useState('');
+  const [gradeFilter, setGradeFilter] = useState('');
+  const [riskFilter, setRiskFilter] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('');
+  /**
+   * Country, taken from the record the same way the column prints it.
+   *
+   * This slot held a status filter, which duplicated work the other three
+   * already did — «مردود» is the blacklist entry of the category filter and the
+   * rejected entry of the grade filter — while country, the one column with no
+   * filter of its own, could only be reached through free-text search.
+   */
+  const [countryFilter, setCountryFilter] = useState('');
+  
+  const [printingVendor, setPrintingVendor] = useState<Vendor | null>(null);
+  const [printingList, setPrintingList] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [perPage, setPerPage] = useState(20);
+  /**
+   * The archive is the longest list in the application and was the only one
+   * that could not be ordered at all — a register you can only read in insert
+   * order is not a register anyone can review.
+   */
+  /**
+   * May this account take a file out of the system?
+   *
+   * Guards both kinds of export the archive offers — the spreadsheets and the
+   * printable forms — because a printed register and an exported one leave the
+   * building the same way.
+   */
+  const canExport = can(currentUser, 'data.export');
+
+  const [sortField, setSortField] = useState<ArchiveSortField>('name');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const onPointer = (e: MouseEvent) => {
+      if (!exportMenuRef.current?.contains(e.target as Node)) setExportMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setExportMenuOpen(false); };
+    document.addEventListener('mousedown', onPointer);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [exportMenuOpen]);
+
+  /**
+   * The recorded "this is the source we chose" decisions.
+   *
+   * The archive is the register people read and export, so a decision that was
+   * made in the category view has to be visible here too — otherwise the
+   * document handed to an auditor shows nine equal-looking rows for a material
+   * where one of them is the one actually chosen.
+   */
+  const [selections, setSelections] = useState<SourceSelectionRecord[]>([]);
+  const [onlySelected, setOnlySelected] = useState(false);
+
+  useEffect(() => {
+    if (isLocalMode()) {
+      try {
+        const saved = localStorage.getItem('app_source_selections');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setSelections(parsed);
+            return;
+          }
+        }
+      } catch {}
+      setSelections(INITIAL_SOURCE_SELECTIONS as any);
+      return;
+    }
+    let cancelled = false;
+    authFetch('/api/source-selections')
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => { if (!cancelled && Array.isArray(data)) setSelections(data); })
+      .catch(() => { /* no recorded choices to show */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const [currentPage, setCurrentPage] = useState(1);
+  const excel = useExcelExport();
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchTerm, gradeFilter, riskFilter, categoryFilter, countryFilter, onlySelected, perPage]);
+
+  /**
+   * The per-category button exports that category, so the on-screen filters do
+   * not apply to it and it says so by carrying no filter summary. The button
+   * beside it exports what is actually on screen.
+   */
+  const handleExportCategory = (catId: string, catLabel: string) => {
+    void excel.run(
+      xl => xl.exportCategoryToExcel(vendors, catId, catLabel, partners, materials, selections),
+      { label: `آرشیو — ${catLabel}`, rows: vendors.length },
+    );
+  };
+
+  /**
+   * The column prints the first word of the display country, so the filter
+   * keys on exactly that: an imported record whose country field holds a whole
+   * address would otherwise put its street on the dropdown and match nothing a
+   * reader can see.
+   */
+  const countryKey = (v: Vendor): string => (getDisplayCountry(v) || '').trim().split(' ')[0];
+
+  const countryOptions = useMemo(() => {
+    const seen = new Set<string>();
+    vendors.forEach(v => { const k = countryKey(v); if (k) seen.add(k); });
+    return [...seen].sort((a, b) => archiveCollator.compare(a, b));
+  }, [vendors]);
+
+  const filteredDb = useMemo(() => {
+    return vendors.filter(v => {
+      const term = searchTerm.toLowerCase();
+      const matchSearch = 
+        v.name.toLowerCase().includes(term) || 
+        v.nameEn.toLowerCase().includes(term) ||
+        v.material.toLowerCase().includes(term) ||
+        v.materialEn.toLowerCase().includes(term) ||
+        v.cas.toLowerCase().includes(term) ||
+        (v.irc && v.irc.toLowerCase().includes(term)) ||
+        (v.country && getDisplayCountry(v).toLowerCase().includes(term)) ||
+        // People look a source up by the company it is connected to, which the
+        // row does not print but the record knows.
+        partners.some(p =>
+          (p.id === v.manufacturerId || p.id === v.supplierId) &&
+          ((p.name || '').toLowerCase().includes(term) || (p.nameEn || '').toLowerCase().includes(term)));
+        
+      // A sample's stored grade is not shown and does not mean anything — the
+      // row prints «بدون گرید» — so it must not answer a grade filter either,
+      // or narrowing to «گرید B» returned rows displaying no grade at all.
+      /*
+       * The grade is derived from the department scores, not read off the
+       * stored column. The archive's own spreadsheet already derived it
+       * (`describeVendorRank`), so the register on screen and the file taken
+       * out of it could name different grades for the same source.
+       */
+      const matchGrade = gradeFilter
+        ? (!isSampleRecord(v) && (gradeFilter === 'rejected'
+            ? isVendorRejected(v)
+            : describeVendorRank(v).grade === gradeFilter))
+        : true;
+      const matchCategory = categoryFilter 
+        ? ((categoryFilter as string) === 'sample'
+            ? (v.isSample || v.category === 'sample')
+            : (categoryFilter as string) === 'approved_samples' 
+            ? (v.isSample && (v.status === 'approved' || v.status === 'conditional'))
+            : (categoryFilter as string) === 'rejected_samples'
+            ? (v.isSample && isVendorRejected(v))
+            : (categoryFilter as string) === 'blacklist'
+            ? isInBlacklistCategory(v)
+            // The ordinary categories, from the one predicate that defines
+            // them (rule 11d). The hand-written pair that stood here is what
+            // rule 11 forbids: a source an administrator disqualified without a
+            // failing score passed straight through it.
+            : isInCategoryRegister(v, categoryFilter as string)
+          )
+        : true;
+      // `__none__` rather than the empty string, which already means "no
+      // filter": a record with no country recorded is a real thing to look for.
+      const matchCountry = countryFilter
+        ? (countryFilter === '__none__' ? !countryKey(v) : countryKey(v) === countryFilter)
+        : true;
+      const riskLevel = v.riskAssessment?.riskLevel || 'Unknown';
+      const matchRisk = riskFilter 
+        // `None` is unreachable — the risk dropdown offers only Low/Medium/High
+        // — so it is left exactly as it was rather than given new behaviour.
+        ? (riskFilter === 'None' ? (!v.riskAssessment) : riskLevel === riskFilter) 
+        : true;
+      
+      const matchSelected = onlySelected ? !!selectionForVendor(v, selections) : true;
+
+      return matchSearch && matchGrade && matchRisk && matchCategory && matchCountry && matchSelected;
+    });
+  }, [vendors, searchTerm, gradeFilter, riskFilter, categoryFilter, countryFilter, onlySelected, selections, partners]);
+
+  const selectedCount = useMemo(
+    () => vendors.filter(v => !!selectionForVendor(v, selections)).length,
+    [vendors, selections],
+  );
+
+  // Rows per page, like the materials, partners and audit tables. The archive
+  // is the longest list in the application and was the only one still fixed at
+  // twenty.
+  const sortedDb = useMemo(() => {
+    const dir = sortOrder === 'asc' ? 1 : -1;
+    const value = (v: Vendor): string | number => {
+      switch (sortField) {
+        case 'material': return v.material || '';
+        case 'category': return categoryLabels[v.category as keyof typeof categoryLabels]?.fa || v.category || '';
+        case 'country': return getDisplayCountry(v) || '';
+        // Grade and risk are ranked, not alphabetical: "A" above "B" and
+        // "High" above "Low" is the order a reviewer means by "sort by risk".
+        case 'grade': return isVendorRejected(v) ? 0 : (GRADE_ORDER[String(describeVendorRank(v).grade)] ?? -1);
+        case 'risk': return RISK_ORDER[String(v.riskAssessment?.riskLevel)] ?? 0;
+        case 'updated': return v.updatedAt ? new Date(v.updatedAt).getTime() : 0;
+        default: return v.name || '';
+      }
+    };
+    return [...filteredDb].sort((a, b) => {
+      const av = value(a);
+      const bv = value(b);
+      const cmp = typeof av === 'number' && typeof bv === 'number'
+        ? av - bv
+        : archiveCollator.compare(String(av), String(bv));
+      // Ties fall back to the company name so the order never shuffles.
+      return (cmp || archiveCollator.compare(a.name || '', b.name || '')) * dir;
+    });
+  }, [filteredDb, sortField, sortOrder]);
+
+  const handleSort = (field: ArchiveSortField) => {
+    if (field === sortField) {
+      setSortOrder(o => (o === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      setSortOrder('asc');
+    }
+    setCurrentPage(1);
+  };
+
+  const clearFilters = () => {
+    setSearchTerm('');
+    setCategoryFilter('');
+    setRiskFilter('');
+    setGradeFilter('');
+    setCountryFilter('');
+    setOnlySelected(false);
+    setCurrentPage(1);
+  };
+  const anyFilterSet = !!(searchTerm || categoryFilter || riskFilter || gradeFilter || countryFilter || onlySelected);
+
+  const ITEMS_PER_PAGE = perPage;
+  const totalItems = filteredDb.length;
+  const totalPages = Math.max(1, Math.ceil(totalItems / ITEMS_PER_PAGE));
+  // Clamped on render, not corrected afterwards: the list shrinks under the
+  // user during a background sync (rule 11a), and a page number left past the
+  // end would render an empty table with no hint of why.
+  const page = Math.min(currentPage, totalPages);
+  const startIndex = (page - 1) * ITEMS_PER_PAGE;
+  const endIndex = startIndex + ITEMS_PER_PAGE;
+  const paginatedDb = useMemo(() => {
+    return sortedDb.slice(startIndex, endIndex);
+  }, [sortedDb, startIndex, endIndex]);
+
+  /**
+   * What the printed extract was filtered by.
+   *
+   * A printed register that does not say what it excluded is not evidence of
+   * anything — "these are our suppliers" reads very differently from "these are
+   * our Grade A foreign suppliers". Built from the controls that are actually
+   * set, so an unfiltered print says so plainly.
+   */
+  /**
+   * The counters every other repository opens with, over the whole archive
+   * rather than the filtered view: this screen is the register of everything
+   * held, so its overview has to answer «چقدر داریم» before the filters narrow
+   * it. The filtered count keeps its own place on the filter bar.
+   */
+  const archiveStats = useMemo(() => {
+    const samples = vendors.filter(isSampleRecord);
+    const sources = vendors.filter(v => !isSampleRecord(v));
+    return {
+      total: vendors.length,
+      sources: sources.length,
+      samples: samples.length,
+      blacklisted: vendors.filter(isVendorRejected).length,
+    };
+  }, [vendors]);
+
+  const filterSummary = useMemo(() => {
+    const parts: string[] = [];
+    if (categoryFilter) parts.push(`دسته: ${categoryLabels[categoryFilter as keyof typeof categoryLabels]?.fa || categoryFilter}`);
+    if (gradeFilter) parts.push(`گرید: ${gradeFilter}`);
+    if (riskFilter) parts.push(`ریسک: ${riskFilter}`);
+    if (countryFilter) parts.push(`کشور: ${countryFilter === '__none__' ? 'ثبت‌نشده' : countryFilter}`);
+    if (onlySelected) parts.push('فقط سورس‌های منتخب');
+    if (searchTerm.trim()) parts.push(`جستجو: «${searchTerm.trim()}»`);
+    return parts.length ? parts.join(' · ') : 'بدون فیلتر — کل آرشیو';
+  }, [categoryFilter, gradeFilter, riskFilter, countryFilter, onlySelected, searchTerm]);
+
+  if (printingList) {
+    return (
+      <PrintableArchiveList
+        vendors={filteredDb}
+        filterSummary={filterSummary}
+        selections={selections}
+        onBack={() => setPrintingList(false)}
+      />
+    );
+  }
+
+  if (printingVendor) {
+    return (
+      <PrintableEvaluationForm
+        vendor={printingVendor}
+        onBack={() => setPrintingVendor(null)}
+        partners={partners}
+        materials={materials}
+        selection={selectionForVendor(printingVendor, selections)}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-6 fade-in text-right">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-border pb-5">
+        {/* The title leads, on the right, the way every other module's header
+            reads. It used to be second in the DOM with `order` classes trying
+            to place it — but this container is RTL, so `order-1` put the export
+            cluster on the right and pushed the title to the left, the opposite
+            of what those classes were written for. Source order alone does the
+            right thing here: first child right on desktop, first child on top
+            when the row stacks.
+
+            `PageTitle` rather than a hand-built heading, for the same reason
+            the four repository screens use it: this one was the last `h2`
+            standing in as a page title, so a screen reader heard a different
+            document outline here than on every other page. */}
+        <PageTitle
+          eyebrow="Vendor Archive Data"
+          eyebrowIcon={Archive}
+          title="آرشیو کل تامین‌کنندگان"
+          subtitle="لیست جامع تمامی تامین‌کنندگان ارزیابی شده"
+        />
+
+        {/* Exports, on the left — offered only to an account allowed to take
+            data out of the system. The data itself is already on screen for
+            anyone who can open this page; what `data.export` governs is the
+            file leaving the building. */}
+        {canExport && (
+        <div className="flex items-center gap-2.5 flex-wrap">
+          {/* One export control, not four.
+              The loudest button on this page used to be the multi-sheet
+              workbook — filled green, larger than everything around it — and
+              it is the rarest of the four exports. Nothing else on the archive
+              competes for the eye, so the page pointed at the thing almost
+              nobody needs, in a colour no other primary action in the
+              application uses.
+
+              The menu below was already a real menu (Escape, outside click,
+              aria-expanded), so the other three moved into it rather than a
+              new one being built. Order is by how often the work actually
+              happens: the filtered view first, the whole register next, one
+              category last. */}
+          <div className="relative" ref={exportMenuRef}>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setExportMenuOpen(o => !o)}
+              disabled={excel.busy}
+              aria-haspopup="menu"
+              aria-expanded={exportMenuOpen}
+              title="خروجی اکسل یا چاپ فهرست"
+            >
+              <Download className="text-primary" />
+              <span>خروجی</span>
+              <ChevronDown className={`text-muted-foreground transition-transform ${exportMenuOpen ? 'rotate-180' : ''}`} />
+            </Button>
+
+            <div role="menu" hidden={!exportMenuOpen} className="absolute left-0 mt-2 w-72 bg-card border border-border rounded-2xl shadow-xl py-1 z-20 divide-y divide-border text-right">
+              <div className="py-1">
+                <div className={exportHeadingClass}>نمای فعلی</div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setExportMenuOpen(false);
+                    excel.run(
+                      xl => xl.exportCategoryToExcel(
+                        filteredDb, 'all', 'نمای_فیلترشده', partners, materials, selections, filterSummary,
+                      ),
+                      { label: 'آرشیو — نمای فیلترشده', rows: filteredDb.length },
+                    );
+                  }}
+                  className={exportItemClass}
+                >
+                  <Download className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                  <span className="flex-1">اکسل از همین فهرست ({filteredDb.length.toLocaleString('fa-IR')} ردیف)</span>
+                </button>
+              </div>
+
+              <div className="py-1">
+                <div className={exportHeadingClass}>کل آرشیو</div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setExportMenuOpen(false);
+                    excel.run(
+                      xl => xl.exportFullArchiveMultiSheetExcel(vendors, partners, materials, selections),
+                      { label: 'آرشیو کامل (چند شیتی)', rows: vendors.length },
+                    );
+                  }}
+                  className={exportItemClass}
+                >
+                  <Download className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                  <span className="flex-1">اکسل چند شیتی — همهٔ دسته‌ها</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => { setExportMenuOpen(false); setPrintingList(true); }}
+                  className={exportItemClass}
+                >
+                  <ListChecks className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                  <span className="flex-1">چاپ فهرست (PDF)</span>
+                </button>
+              </div>
+
+              <div className="py-1">
+                <div className={exportHeadingClass}>تفکیک دسته‌بندی</div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => { setExportMenuOpen(false); handleExportCategory('all', 'کل_آرشیو'); }}
+                  className={exportItemClass}
+                >
+                  <span className="font-mono text-2xs text-muted-foreground w-16 shrink-0">All</span>
+                  <span className="flex-1">گزارش تجمیعی کل آرشیو</span>
+                </button>
+                {Object.entries(categoryLabels).map(([key, labelData]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    role="menuitem"
+                    onClick={() => { setExportMenuOpen(false); handleExportCategory(key, labelData.fa); }}
+                    className={exportItemClass}
+                  >
+                    <span className="font-mono text-2xs text-muted-foreground w-16 shrink-0 truncate">{key}</span>
+                    <span className="flex-1">گزارش {labelData.fa}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* The spreadsheet writer is fetched on demand, so a download can now
+              fail before it starts. Saying nothing would look like a dead
+              button. */}
+          {excel.busy && (
+            <span className="text-xs text-muted-foreground self-center">در حال آماده‌سازی خروجی…</span>
+          )}
+          {excel.error && (
+            <p className="text-xs text-rose-600 dark:text-rose-400 self-center max-w-sm">{excel.error}</p>
+          )}
+        </div>
+        )}
+
+      </div>
+
+      {/* On a phone the same five figures are a strip, not a grid.
+          Five tiles in two columns leave one alone in the last row, and the
+          block cost about 340px of an 844px screen — so the first row of the
+          register, which is what this page is for, started below the fold. The
+          desktop grid is unchanged; only the narrow case is rewritten. */}
+      <div className="sm:hidden -mt-2 mb-4 flex flex-wrap gap-x-4 gap-y-1.5 text-2xs">
+        {[
+          { label: 'کل', value: archiveStats.total, tone: 'text-foreground' },
+          { label: 'سورس', value: archiveStats.sources, tone: 'text-indigo-600 dark:text-indigo-300' },
+          { label: 'نمونه', value: archiveStats.samples, tone: 'text-primary' },
+          { label: 'منتخب', value: selectedCount, tone: 'text-amber-600 dark:text-amber-300' },
+          { label: 'لیست سیاه', value: archiveStats.blacklisted, tone: 'text-rose-600 dark:text-rose-300' },
+        ].map(s => (
+          <span key={s.label} className="flex items-baseline gap-1">
+            <span className={`font-mono font-bold text-xs ${s.tone}`}>
+              {isLoading ? '—' : s.value.toLocaleString('fa-IR')}
+            </span>
+            <span className="text-muted-foreground">{s.label}</span>
+          </span>
+        ))}
+      </div>
+
+      <div className="hidden sm:grid sm:grid-cols-3 lg:grid-cols-5 gap-3">
+        {[
+          { label: 'کل رکوردها', hint: 'Total Records', value: archiveStats.total, icon: Archive,
+            tone: 'bg-muted text-foreground border-border' },
+          { label: 'سورس‌ها', hint: 'Sources', value: archiveStats.sources, icon: FileText,
+            tone: 'bg-indigo-50 text-indigo-600 border-indigo-100 dark:bg-indigo-950/50 dark:text-indigo-300 dark:border-indigo-900' },
+          { label: 'نمونه‌ها', hint: 'Samples', value: archiveStats.samples, icon: ClipboardList,
+            tone: 'bg-primary/10 text-primary border-primary/20' },
+          { label: 'سورس‌های منتخب', hint: 'Chosen Sources', value: selectedCount, icon: Star,
+            tone: 'bg-amber-50 text-amber-600 border-amber-100 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-900' },
+          { label: 'در لیست سیاه', hint: 'Blacklisted', value: archiveStats.blacklisted, icon: ShieldAlert,
+            tone: 'bg-rose-50 text-rose-600 border-rose-100 dark:bg-rose-950/50 dark:text-rose-300 dark:border-rose-900' },
+        ].map(card => (
+          <StatTile key={card.hint} {...card} hintDir="ltr" loading={isLoading} />
+        ))}
+      </div>
+
+      {/* Search and filters.
+
+          The search was a bare `<input>` inside a frosted panel — the same
+          pattern removed from the supplier module — and the four selects were
+          rendered from an array with no labels at all, so they could only be
+          told apart by the wording of their default option. Each now says what
+          it filters, and the bar reports how much of the archive is showing. */}
+      <div className="bg-card border border-border rounded-2xl p-4 shadow-xs space-y-3 mb-6">
+        <div className="relative">
+          <span className="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-muted-foreground">
+            <Search className="w-4 h-4" />
+          </span>
+          <Input
+            type="text"
+            value={searchTerm}
+            onChange={e => { setSearchTerm(e.target.value); setCurrentPage(1); }}
+            placeholder="جستجو در نام شرکت، ماده، کد CAS، IRC، کشور یا شریک تجاری…"
+            className="pr-10 pl-10 w-full"
+            aria-label="جستجو در آرشیو"
+          />
+          {searchTerm && (
+            <button
+              type="button"
+              onClick={() => setSearchTerm('')}
+              aria-label="پاک کردن جستجو"
+              className="absolute inset-y-0 left-0 flex items-center pl-3 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-end gap-3">
+          {([
+            {
+              key: 'category', label: 'دسته‌بندی', value: categoryFilter, setValue: setCategoryFilter,
+              options: [{ val: '', label: 'همهٔ دسته‌ها' }, ...Object.entries(categoryLabels).map(([k, v]) => ({ val: k, label: v.fa }))],
+            },
+            {
+              key: 'risk', label: 'سطح ریسک', value: riskFilter, setValue: setRiskFilter,
+              options: [
+                { val: '', label: 'همهٔ سطوح' }, { val: 'Low', label: 'پایین (Low)' },
+                { val: 'Medium', label: 'متوسط (Medium)' }, { val: 'High', label: 'بالا (High)' },
+              ],
+            },
+            {
+              key: 'grade', label: 'گرید کیفی', value: gradeFilter, setValue: setGradeFilter,
+              options: [
+                { val: '', label: 'همهٔ گریدها' }, { val: 'A', label: 'Grade A' },
+                { val: 'B', label: 'Grade B' }, { val: 'C', label: 'Grade C' },
+                { val: 'rejected', label: 'مردود / لیست سیاه' },
+              ],
+            },
+            {
+              key: 'country', label: 'کشور', value: countryFilter, setValue: setCountryFilter,
+              options: [
+                { val: '', label: 'همهٔ کشورها' },
+                ...countryOptions.map(c => ({ val: c, label: c })),
+                { val: '__none__', label: 'بدون کشور ثبت‌شده' },
+              ],
+            },
+          ]).map(filter => (
+            <label key={filter.key} className="flex flex-col gap-1 min-w-[150px] flex-1 md:flex-none">
+              <span className="text-2xs font-bold text-muted-foreground">{filter.label}</span>
+              <select
+                value={filter.value}
+                onChange={e => { filter.setValue(e.target.value); setCurrentPage(1); }}
+                className={cn(inputBaseClass, 'w-full md:w-44')}
+              >
+                {filter.options.map(opt => <option key={opt.val} value={opt.val}>{opt.label}</option>)}
+              </select>
+            </label>
+          ))}
+
+          {/* A star invites the question "which ones are chosen?", so the answer
+              is one click away rather than a scroll through every page. Hidden
+              when nothing has been chosen yet, so it never offers an empty
+              result. */}
+          {selectedCount > 0 && (
+            <button
+              type="button"
+              onClick={() => { setOnlySelected(v => !v); setCurrentPage(1); }}
+              aria-pressed={onlySelected}
+              title="نمایش فقط سورس‌هایی که به‌عنوان منتخب ثبت شده‌اند"
+              className={`shrink-0 flex items-center gap-1.5 text-xs font-bold rounded-xl py-2 px-3 border transition-colors cursor-pointer ${
+                onlySelected
+                  ? 'bg-amber-50 text-amber-800 border-amber-300 dark:bg-amber-950/40 dark:text-amber-200 dark:border-amber-800'
+                  : 'bg-card text-muted-foreground border-border hover:bg-accent'
+              }`}
+            >
+              <Star className={`w-3.5 h-3.5 ${onlySelected ? 'fill-current' : ''}`} />
+              <span>فقط منتخب‌ها ({selectedCount.toLocaleString('fa-IR')})</span>
+            </button>
+          )}
+
+          {anyFilterSet && (
+            <div className="flex items-center gap-2 pb-0.5">
+              <Button type="button" variant="outline" size="sm" onClick={clearFilters} className="font-bold">
+                حذف فیلترها
+              </Button>
+              <span className="text-2xs text-muted-foreground">
+                {totalItems.toLocaleString('fa-IR')} از {vendors.length.toLocaleString('fa-IR')} رکورد
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ARCHIVE TABLE
+
+          A real `<table>`, not a grid of `div`s. The rows carried the whole
+          register in `grid-cols-12` divs, so a screen reader heard a pile of
+          text with no column names, nothing could be sorted, and the empty and
+          loading states were hand-built copies of the shared ones.
+
+          Grade and risk get columns of their own: both were filterable and
+          neither was displayed, so choosing "Grade A" gave a list nobody could
+          check by eye. */}
+      <div className="rounded-2xl overflow-hidden border border-border shadow-xs bg-card mb-8">
+        <div className="overflow-x-auto">
+          <table className="w-full text-right" aria-busy={isLoading}>
+            <caption className="sr-only">آرشیو کامل سورس‌ها با امکان مرتب‌سازی بر اساس هر ستون</caption>
+            <thead>
+              <tr className="bg-muted text-muted-foreground border-b border-border text-xs">
+                <SortHeader field="name" label="تأمین‌کننده" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} />
+                <SortHeader field="material" label="ماده" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} />
+                <SortHeader field="grade" label="گرید" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} center className="hidden md:table-cell" />
+                <SortHeader field="risk" label="ریسک" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} center className="hidden md:table-cell" />
+                <SortHeader field="category" label="دسته" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} className="hidden sm:table-cell" />
+                <SortHeader field="country" label="کشور" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} className="hidden sm:table-cell" />
+                <SortHeader field="updated" label="آخرین تغییر" sortField={sortField} sortOrder={sortOrder} onSort={handleSort} className="hidden lg:table-cell" />
+                <th scope="col" className="py-3 px-4 text-xs font-bold text-center w-24">اقدام</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border text-sm">
+              {isLoading ? (
+                <TableSkeletonRows
+                  rows={8}
+                  columns={8}
+                  barClassName="h-3"
+                  rowClassName="border-b border-border/60 last:border-0"
+                  width={(c, i) => (c === 7 ? '4rem' : `${55 + ((i + c) % 3) * 15}%`)}
+                />
+              ) : sortedDb.length === 0 ? (
+                anyFilterSet ? (
+                  <TableEmptyRow
+                    colSpan={8}
+                    icon={Search}
+                    message="هیچ رکوردی با این فیلترها پیدا نشد."
+                    action={
+                      <Button type="button" variant="outline" size="sm" onClick={clearFilters} className="font-bold">
+                        حذف فیلترها
+                      </Button>
+                    }
+                    note="جستجو نام شرکت، ماده، کد CAS، IRC، کشور و شریک تجاری را می‌گردد."
+                  />
+                ) : (
+                  <TableEmptyRow
+                    colSpan={8}
+                    icon={Archive}
+                    message="آرشیو خالی است."
+                    note="با ثبت اولین سورس، رکورد آن همین‌جا بایگانی می‌شود."
+                  />
+                )
+              ) : paginatedDb.map(v => {
+                const chosen = selectionForVendor(v, selections);
+                const risk = v.riskAssessment?.riskLevel;
+                return (
+                  <tr key={v.id} className="hover:bg-accent transition-colors">
+                    <td className="py-3 px-4 min-w-0">
+                      {/* The star marks the row, not the company: a supplier can
+                          be the chosen source for one material and not for
+                          another, so the mark belongs to this vendor+material
+                          pair. The title carries the reason and who signed for
+                          it, because a bare star only raises the question
+                          "chosen for what, by whom?". */}
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {chosen && (
+                          <span
+                            className="shrink-0 inline-flex items-center gap-1 text-2xs font-bold text-amber-700 bg-amber-50 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900 px-1.5 py-0.5 rounded-md"
+                            title={`سورس منتخب برای «${v.material || v.materialEn}» — ${describeSelection(chosen)}`}
+                          >
+                            <Star className="w-3 h-3 fill-current" />
+                            <span>منتخب</span>
+                          </span>
+                        )}
+                        <EntityName name={v.name} lines={2} className="font-semibold text-foreground text-sm" />
+                      </div>
+                      {/* Imported rows carry a literal "Unknown"/"N/A" as the
+                          Latin name; printed under the company it read like the
+                          company's actual English name. Nothing is clearer than
+                          a wrong name. */}
+                      {cleanPlaceholder(v.nameEn) && (
+                        <EntityName as="div" name={v.nameEn} lines={1} dir="ltr" className="text-muted-foreground text-xs mt-0.5" />
+                      )}
+                    </td>
+                    <td className="py-3 px-4 min-w-0">
+                      <EntityName as="div" name={v.material} lines={2} className="text-muted-foreground text-sm" />
+                      <div className="font-mono text-muted-foreground text-xs truncate mt-0.5">{v.cas || 'N/A'}</div>
+                    </td>
+                    <td className="py-3 px-4 text-center hidden md:table-cell">
+                      {/* A sample has no grade to show: departments do not
+                          score it, so a grade badge here asserted a verdict
+                          nobody reached. Its own verdict — the laboratory's —
+                          is already printed in the category cell, so this one
+                          says plainly that the question does not apply. */}
+                      {isSampleRecord(v) ? (
+                        <Badge variant="stage" className="text-2xs" title="نمونه امتیازدهی دپارتمانی ندارد">بدون گرید</Badge>
+                      ) : (
+                        <GradeBadge vendor={v} grade={describeVendorRank(v).grade} />
+                      )}
+                    </td>
+                    <td className="py-3 px-4 text-center hidden md:table-cell">
+                      {/* "Not assessed" is a finding of its own — the risk
+                          backlog on the dashboard counts exactly these — so it
+                          is named rather than left blank. */}
+                      {/* One shape for the whole column. The three risk levels
+                          were already badges, but hand-rolled with their own
+                          radius and their own copy of the three tones, and
+                          «ارزیابی نشده» was bare text beside them — so the
+                          absence of an assessment read as data rather than as
+                          the finding it is. The levels use the semantic badge
+                          variants, and the missing one uses `stage`, the same
+                          neutral badge a source with no grade yet carries. */}
+                      {isSampleRecord(v) ? (
+                        <span className="text-2xs text-muted-foreground" title="برای نمونه ارزیابی ریسک انجام نمی‌شود">—</span>
+                      ) : risk ? (
+                        <Badge
+                          variant={risk === 'High' ? 'destructive' : risk === 'Medium' ? 'warning' : 'success'}
+                          className="text-2xs font-bold"
+                        >
+                          {RISK_LABEL[risk] || risk}
+                        </Badge>
+                      ) : (
+                        <Badge variant="stage" className="text-2xs" title="ارزیابی ریسک برای این سورس ثبت نشده است">
+                          ارزیابی نشده
+                        </Badge>
+                      )}
+                    </td>
+                    <td className="py-3 px-4 min-w-0 hidden sm:table-cell">
+                      <span className="bg-muted border border-border text-xs text-muted-foreground rounded px-2 py-0.5 inline-block truncate max-w-full font-medium">
+                        {v.isSample
+                          ? `نمونه — ${describeSampleStatus(v).label}`
+                          : (categoryLabels[v.category as keyof typeof categoryLabels]?.fa || v.category)
+                        }
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 min-w-0 hidden sm:table-cell text-muted-foreground text-sm truncate">
+                      {getDisplayCountry(v).split(' ')[0]}
+                    </td>
+                    <td className="py-3 px-4 hidden lg:table-cell text-muted-foreground">
+                      {v.updatedAt ? (
+                        <span className="font-mono text-2xs" title={new Date(v.updatedAt).toLocaleString('fa-IR')}>
+                          {new Date(v.updatedAt).toLocaleDateString('fa-IR')}
+                        </span>
+                      ) : (
+                        <span className="text-2xs text-muted-foreground/60">—</span>
+                      )}
+                    </td>
+                    <td className="py-3 px-4">
+                      <div className="flex items-center justify-center gap-1">
+                        {/* The archive could print a record but not open it:
+                            seeing the detail meant finding the same source again
+                            through its category. */}
+                        {onSelectVendor && (
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            onClick={() => onSelectVendor(v)}
+                            className="text-muted-foreground hover:text-primary border border-transparent hover:border-border"
+                            title={`باز کردن پروندهٔ «${v.name}»`}
+                          >
+                            <ExternalLink />
+                          </Button>
+                        )}
+                        {/* Printing follows `vendor.read`, the permission that
+                            already lets someone open this page and export the
+                            whole archive to Excel. Gating it on
+                            `role === 'admin'` protected nothing — the same data
+                            left the building through the export button next to
+                            it — while making QA ask an admin to print a form
+                            they are entitled to read. */}
+                        {canExport && (
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            onClick={() => setPrintingVendor(v)}
+                            className="text-muted-foreground hover:text-primary border border-transparent hover:border-border"
+                            title="چاپ فرم ارزیابی"
+                          >
+                            <Printer />
+                          </Button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+        <PerPageSelect value={perPage} onChange={n => { setPerPage(n); setCurrentPage(1); }} />
+        <div className="flex-1">
+          <Pagination
+            currentPage={page}
+            totalPages={totalPages}
+            totalItems={totalItems}
+            startIndex={startIndex}
+            endIndex={endIndex}
+            onPageChange={setCurrentPage}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// --- View: Vendor Detail ---

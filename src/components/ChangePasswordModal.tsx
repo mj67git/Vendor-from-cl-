@@ -1,0 +1,381 @@
+import { Button } from './ui/button';
+import { FormModal } from './FormModal';
+import React, { useState } from 'react';
+import { Shield, Key, AlertCircle, CheckCircle, Eye, EyeOff, X } from 'lucide-react';
+import { User } from '../types';
+import { authFetch } from '../services/authFetch';
+import { Input } from './ui/input';
+
+interface ChangePasswordModalProps {
+  currentUser: User;
+  isForceChange?: boolean; // If true, can't be closed, acts as initial setup screen
+  onClose?: () => void;
+  onPasswordChanged: (updatedUser: User) => void;
+  onLogout?: () => void; // Provided during force change to allow logging out
+}
+
+export function ChangePasswordModal({
+  currentUser,
+  isForceChange = false,
+  onClose,
+  onPasswordChanged,
+  onLogout
+}: ChangePasswordModalProps) {
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const [showCurrent, setShowCurrent] = useState(false);
+  const [showNew, setShowNew] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      setError('لطفاً تمامی فیلدها را تکمیل فرمایید.');
+      return;
+    }
+
+    if (newPassword === '123' || newPassword === '123456') {
+      setError('کلمه عبور جدید نمی‌تواند رمز پیش‌فرض باشد.');
+      return;
+    }
+
+    if (newPassword.length < 6) {
+      setError('کلمه عبور جدید باید حداقل ۶ کاراکتر باشد.');
+      return;
+    }
+
+    if (newPassword !== confirmPassword) {
+      setError('کلمه عبور جدید و تکرار آن با یکدیگر مطابقت ندارند.');
+      return;
+    }
+
+    setLoading(true);
+
+    // Goes through authFetch like every other call: attaching the token by hand
+    // also meant skipping its 401/403 handling, so an expired session showed a
+    // generic error here instead of signing the user out.
+    authFetch('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword, newPassword })
+    })
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'خطا در تغییر کلمه عبور.');
+        }
+        return data;
+      })
+      .then((data) => {
+        setSuccess(true);
+        // Save the updated user object to local storage
+        if (data.user) {
+          localStorage.setItem('app_currentUser', JSON.stringify(data.user));
+          setTimeout(() => {
+            onPasswordChanged(data.user);
+            if (onClose) onClose();
+          }, 1500);
+        } else {
+          // Fallback if user is not in response
+          const updatedUser = { ...currentUser, mustChangePassword: false };
+          localStorage.setItem('app_currentUser', JSON.stringify(updatedUser));
+          setTimeout(() => {
+            onPasswordChanged(updatedUser);
+            if (onClose) onClose();
+          }, 1500);
+        }
+      })
+      .catch((err) => {
+        setError(err.message || 'ارتباط با سرور برقرار نشد.');
+      })
+      .finally(() => {
+        setLoading(false);
+      });
+  };
+
+  // Render a full-page force reset screen
+  if (isForceChange) {
+    return (
+      <div className="min-h-screen bg-muted flex items-center justify-center p-4 font-sans">
+        <div className="bg-card border border-border rounded-3xl p-8 max-w-md w-full shadow-[0_12px_40px_rgba(0,0,0,0.06)] fade-in">
+          <div className="text-center mb-6">
+            <div className="flex items-center justify-center mx-auto mb-4 bg-amber-500/10 border border-amber-500/20 w-16 h-16 rounded-2xl">
+              <Shield className="w-8 h-8 text-amber-600 bounce-in" />
+            </div>
+            <h1 className="text-xl font-extrabold text-foreground mb-2 leading-snug">تغییر الزامی کلمه عبور اولیه</h1>
+            <p className="text-muted-foreground text-xs leading-relaxed">
+              کاربر گرامی <span className="font-bold text-foreground">{currentUser.name}</span>، جهت حفظ امنیت سامانه و رعایت استانداردهای کیفی دارو، تغییر رمز عبور پیش‌فرض در اولین ورود الزامی است.
+            </p>
+          </div>
+
+          {success ? (
+            <div className="py-8 text-center space-y-3">
+              <div className="inline-flex items-center justify-center bg-emerald-500/10 border border-emerald-500/20 p-3 rounded-full mb-2">
+                <CheckCircle className="w-10 h-10 text-emerald-500 bounce-in" />
+              </div>
+              <h4 className="text-base font-bold text-foreground">کلمه عبور با موفقیت تغییر یافت</h4>
+              <p className="text-xs text-muted-foreground">در حال ورود به سامانه، لطفاً شکیبا باشید...</p>
+            </div>
+          ) : (
+            <form onSubmit={handleSubmit} className="space-y-4">
+              {error && (
+                <div role="alert" aria-live="polite" className="p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-700 text-xs font-semibold leading-relaxed flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              <div className="space-y-1">
+                <label htmlFor="current_password_input" className="block text-xs font-bold text-foreground">کلمه عبور فعلی (پیش‌فرض)</label>
+                <div className="relative">
+                  <Input
+                    id="current_password_input"
+                    autoComplete="current-password"
+                    type={showCurrent ? 'text' : 'password'}
+                    required
+                    disabled={loading}
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    className="w-full pl-10 pr-4 text-left font-mono leading-none disabled:opacity-50"
+                    placeholder="کلمه عبور فعلی"
+                  />
+                  <button
+                    type="button"
+                    aria-label={showCurrent ? 'پنهان کردن کلمه عبور فعلی' : 'نمایش کلمه عبور فعلی'}
+                    onClick={() => setShowCurrent(!showCurrent)}
+                    className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-muted-foreground"
+                  >
+                    {showCurrent ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label htmlFor="new_password_input" className="block text-xs font-bold text-foreground">کلمه عبور جدید</label>
+                <div className="relative">
+                  <Input
+                    id="new_password_input"
+                    autoComplete="new-password"
+                    type={showNew ? 'text' : 'password'}
+                    required
+                    disabled={loading}
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    className="w-full pl-10 pr-4 text-left font-mono leading-none disabled:opacity-50"
+                    placeholder="رمز عبور حداقل ۶ کاراکتر"
+                  />
+                  <button
+                    type="button"
+                    aria-label={showNew ? 'پنهان کردن کلمه عبور جدید' : 'نمایش کلمه عبور جدید'}
+                    onClick={() => setShowNew(!showNew)}
+                    className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-muted-foreground"
+                  >
+                    {showNew ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label htmlFor="confirm_password_input" className="block text-xs font-bold text-foreground">تکرار کلمه عبور جدید</label>
+                <div className="relative">
+                  <Input
+                    id="confirm_password_input"
+                    autoComplete="new-password"
+                    type={showConfirm ? 'text' : 'password'}
+                    required
+                    disabled={loading}
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    className="w-full pl-10 pr-4 text-left font-mono leading-none disabled:opacity-50"
+                    placeholder="تکرار رمز عبور جدید"
+                  />
+                  <button
+                    type="button"
+                    aria-label={showConfirm ? 'پنهان کردن تکرار کلمه عبور' : 'نمایش تکرار کلمه عبور'}
+                    onClick={() => setShowConfirm(!showConfirm)}
+                    className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-muted-foreground"
+                  >
+                    {showConfirm ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <div className="pt-3 flex flex-col gap-2">
+                <Button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-indigo-600/20 font-bold text-xs"
+                >
+                  {loading ? 'در حال ذخیره‌سازی...' : 'ثبت و ورود به سامانه'}
+                </Button>
+                {onLogout && (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={onLogout}
+                    className="w-full text-muted-foreground font-bold text-xs"
+                  >
+                    خروج از حساب کاربری
+                  </Button>
+                )}
+              </div>
+            </form>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Otherwise, render as a Standard Overlay Modal
+  return (
+    <FormModal
+      open
+      onClose={() => onClose?.()}
+      size="sm"
+      closeOnBackdrop={false}
+      labelledBy="change-password-title"
+      className="p-6 font-sans"
+    >
+        <Button
+          type="button"
+          variant="outline"
+          size="icon-sm"
+          aria-label="بستن پنجره تغییر رمز عبور"
+          onClick={onClose}
+          disabled={loading}
+          className="absolute top-4 left-4 text-muted-foreground"
+        >
+          <X />
+        </Button>
+
+        <div className="flex items-center gap-3 mb-6">
+          <div className="bg-indigo-50 border border-indigo-100 p-2.5 rounded-2xl">
+            <Key className="w-5 h-5 text-indigo-600" />
+          </div>
+          <div className="text-right">
+            <h3 id="change-password-title" className="text-base font-extrabold text-foreground">تغییر رمز عبور</h3>
+            <p className="text-2xs text-muted-foreground mt-0.5">بروزرسانی اطلاعات امنیتی حساب کاربری</p>
+          </div>
+        </div>
+
+        {success ? (
+          <div className="py-6 text-center space-y-3">
+            <div className="inline-flex items-center justify-center bg-emerald-500/10 border border-emerald-500/20 p-3 rounded-full mb-2">
+              <CheckCircle className="w-10 h-10 text-emerald-500 bounce-in" />
+            </div>
+            <h4 className="text-sm font-bold text-foreground font-sans">کلمه عبور با موفقیت بروزرسانی شد</h4>
+            <p className="text-xs text-muted-foreground">کارت تبریک! این پنجره به زودی بسته می‌شود...</p>
+          </div>
+        ) : (
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {error && (
+              <div role="alert" aria-live="polite" className="p-3 bg-red-50 border border-red-200 rounded-xl text-red-700 text-xs font-semibold leading-relaxed flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            <div className="space-y-1 text-right">
+              <label htmlFor="current_password_input" className="block text-xs font-bold text-foreground">کلمه عبور فعلی</label>
+              <div className="relative">
+                <Input
+                  id="current_password_input"
+                  autoComplete="current-password"
+                  type={showCurrent ? 'text' : 'password'}
+                  required
+                  disabled={loading}
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  className="w-full pl-10 pr-4 text-left font-mono leading-none disabled:opacity-50"
+                  placeholder="رمز عبور کنونی"
+                />
+                <button
+                  type="button"
+                  aria-label={showCurrent ? 'پنهان کردن کلمه عبور فعلی' : 'نمایش کلمه عبور فعلی'}
+                  onClick={() => setShowCurrent(!showCurrent)}
+                  className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-muted-foreground"
+                >
+                  {showCurrent ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1 text-right">
+              <label htmlFor="new_password_input" className="block text-xs font-bold text-foreground">کلمه عبور جدید</label>
+              <div className="relative">
+                <Input
+                  id="new_password_input"
+                  autoComplete="new-password"
+                  type={showNew ? 'text' : 'password'}
+                  required
+                  disabled={loading}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className="w-full pl-10 pr-4 text-left font-mono leading-none disabled:opacity-50"
+                  placeholder="حداقل ۶ کاراکتر"
+                />
+                <button
+                  type="button"
+                  aria-label={showNew ? 'پنهان کردن کلمه عبور جدید' : 'نمایش کلمه عبور جدید'}
+                  onClick={() => setShowNew(!showNew)}
+                  className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-muted-foreground"
+                >
+                  {showNew ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1 text-right">
+              <label htmlFor="confirm_password_input" className="block text-xs font-bold text-foreground">تکرار کلمه عبور جدید</label>
+              <div className="relative">
+                <Input
+                  id="confirm_password_input"
+                  autoComplete="new-password"
+                  type={showConfirm ? 'text' : 'password'}
+                  required
+                  disabled={loading}
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  className="w-full pl-10 pr-4 text-left font-mono leading-none disabled:opacity-50"
+                  placeholder="تکرار رمز عبور جدید"
+                />
+                <button
+                  type="button"
+                  aria-label={showConfirm ? 'پنهان کردن تکرار کلمه عبور' : 'نمایش تکرار کلمه عبور'}
+                  onClick={() => setShowConfirm(!showConfirm)}
+                  className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-muted-foreground"
+                >
+                  {showConfirm ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            <div className="pt-3 flex gap-3">
+              <Button
+                type="submit"
+                disabled={loading}
+                className="flex-1 bg-indigo-600 text-white hover:bg-indigo-700 hover:shadow-indigo-600/20 font-bold text-xs"
+              >
+                {loading ? 'در حال ثبت...' : 'ذخیره کلمه عبور'}
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={onClose}
+                disabled={loading}
+                className="text-muted-foreground font-bold text-xs"
+              >
+                انصراف
+              </Button>
+            </div>
+          </form>
+        )}
+    </FormModal>
+  );
+}

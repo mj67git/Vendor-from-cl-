@@ -1,0 +1,8 @@
+{
+  "name": "Remix vlse-release",
+  "description": "Imported from GitHub: mj67git/vlse-release",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

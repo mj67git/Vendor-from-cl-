@@ -1,0 +1,286 @@
+import http from 'node:http';
+import { AddressInfo } from 'node:net';
+
+/**
+ * A real HTTP server, a real database, real middleware.
+ *
+ * `server.ts` is 4,400 lines and had no automated coverage at all: the routing,
+ * the auth guards, the permission checks and the read-modify-write persistence
+ * were verified by hand or not at all. The unit tests cover the pure rules
+ * (`permissions.ts`, `sopEvaluation.ts`, `vendorState.ts`) but a rule is only
+ * a control once an endpoint enforces it, and that is what these exercise.
+ *
+ * It drives the app the way a browser does — over HTTP, through every
+ * middleware — rather than calling handlers directly, because the guards ARE
+ * middleware and a test that skips them proves nothing.
+ *
+ * Without a DATABASE_URL the whole API suite skips rather than fails, so
+ * `npm test` still works on a machine with no PostgreSQL. CI provides one.
+ */
+
+import { isValidPostgresUrl } from '../../src/server/db/prisma.js';
+
+export const DATABASE_AVAILABLE = Boolean(isValidPostgresUrl(process.env.DATABASE_URL));
+
+export const SKIP = DATABASE_AVAILABLE
+  ? undefined
+  : { skip: 'no DATABASE_URL — start PostgreSQL to run the API tests' };
+
+export interface ApiResponse<T = any> {
+  status: number;
+  body: T;
+  /** Response headers, for the few facts the server states there rather than in the body. */
+  headers: Headers;
+}
+
+let server: http.Server | null = null;
+let baseUrl = '';
+let prisma: any = null;
+
+/** Boot the application once for the whole file. */
+export async function startTestServer(): Promise<string> {
+  if (server) return baseUrl;
+
+  // VERCEL stops server.ts binding its own port; production mode skips the Vite
+  // dev middleware, which would otherwise compile the frontend for an API test.
+  process.env.VERCEL = '1';
+  process.env.NODE_ENV = 'production';
+  process.env.JWT_SECRET ||= 'test-secret-at-least-32-characters-long!!';
+
+  const mod = await import('../../server');
+  const handler = (mod as any).default;
+
+  server = http.createServer((req, res) => handler(req, res));
+  await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve));
+  const { port } = server!.address() as AddressInfo;
+  baseUrl = `http://127.0.0.1:${port}`;
+
+  if (DATABASE_AVAILABLE) {
+    const { PrismaClient } = await import('@prisma/client');
+    prisma = new PrismaClient();
+  }
+
+  // `startServer()` seeds the default users and partners on first boot, and the
+  // import resolves before that promise settles. One request forces the wait —
+  // otherwise the fixture races the seeding and loses on a unique constraint.
+  await fetch(`${baseUrl}/api/health`).catch(() => {});
+  return baseUrl;
+}
+
+export async function stopTestServer(): Promise<void> {
+  await prisma?.$disconnect();
+  prisma = null;
+  await new Promise<void>(resolve => server?.close(() => resolve()) ?? resolve());
+  server = null;
+}
+
+export function db() {
+  if (!prisma) throw new Error('startTestServer() first');
+  return prisma;
+}
+
+/** One request, with the token attached the way the client attaches it. */
+export async function api<T = any>(
+  path: string,
+  options: {
+    method?: string;
+    token?: string | null;
+    body?: unknown;
+    headers?: Record<string, string>;
+  } = {},
+): Promise<ApiResponse<T>> {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: options.method || 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
+      ...(options.headers || {}),
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  let body: any = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  return { status: res.status, body, headers: res.headers };
+}
+
+export async function login(username: string, password = '123'): Promise<string> {
+  const res = await api<{ token: string }>('/api/auth/login', {
+    method: 'POST',
+    body: { username, password },
+  });
+  if (!res.body?.token) {
+    throw new Error(`login failed for ${username}: ${res.status} ${JSON.stringify(res.body)}`);
+  }
+  return res.body.token;
+}
+
+/**
+ * A known starting point for each test.
+ *
+ * Truncating rather than deleting per-table keeps the order-of-foreign-keys
+ * problem out of the tests; CASCADE is safe here because the fixture rebuilds
+ * everything the tests rely on.
+ */
+export async function resetDatabase(): Promise<void> {
+  const p = db();
+  await p.$executeRawUnsafe(`
+    TRUNCATE TABLE
+      source_selections, activity_logs, analysis_records, risk_assessments,
+      evaluations, vendor_materials, sop_documents, supplier_evaluations,
+      vendors, business_partners, materials, audit_log
+    RESTART IDENTITY CASCADE
+  `);
+}
+
+export const FIXTURE = {
+  materialId: 'M-TEST',
+  vendorId: 'V-TEST',
+  supplierA: 'BP-A',
+  supplierB: 'BP-B',
+};
+
+/**
+ * One material, two Grade-A sellers, one source linked to the first.
+ *
+ * Grade A because `sopSupplierViolation` refuses to attach anything less, so a
+ * lower grade would make every write test fail for the wrong reason.
+ */
+export async function seedFixture(): Promise<void> {
+  const p = db();
+  await p.material.create({
+    data: { id: FIXTURE.materialId, name: 'پاراستامول', nameEn: 'Paracetamol', cas: '103-90-2', irc: 'N/A' },
+  });
+  for (const [id, name, nameEn] of [
+    [FIXTURE.supplierA, 'فروشندهٔ الف', 'Seller A'],
+    [FIXTURE.supplierB, 'فروشندهٔ ب', 'Seller B'],
+  ]) {
+    await p.businessPartner.create({
+      data: { id, name, nameEn, type: 'Supplier', country: 'Turkey', status: 'Active' },
+    });
+    await p.supplierEvaluation.create({
+      data: { id: `SE-${id}`, partnerId: id, totalScore: 100, grade: 'A', status: 'Approved' },
+    });
+  }
+  await p.vendor.create({
+    data: {
+      id: FIXTURE.vendorId, name: 'فروشندهٔ الف', nameEn: 'Seller A', country: 'Turkey',
+      status: 'new', grade: 'B', supplierId: FIXTURE.supplierA, contactInfo: 'آدرس تماس',
+    },
+  });
+  await p.vendorMaterial.create({
+    data: {
+      id: `VM-${FIXTURE.vendorId}`, vendorId: FIXTURE.vendorId,
+      materialId: FIXTURE.materialId, isSample: false, category: 'foreign',
+    },
+  });
+}
+
+/**
+ * The password hash, computed once for the whole run.
+ *
+ * PBKDF2 at 210,000 iterations is deliberately slow — that is the point of it —
+ * so hashing five accounts before every test cost more than the tests. The
+ * value being hashed is the same every time, so it is computed once. Never do
+ * this outside a test: a shared salt is exactly what per-user salts prevent.
+ */
+let sharedCredential: { hash: string; salt: string } | null = null;
+async function testCredential() {
+  if (!sharedCredential) {
+    const { generateSalt, hashPassword } = await import('../../src/server/security/passwordService');
+    const salt = generateSalt();
+    sharedCredential = { salt, hash: hashPassword('123', salt) };
+  }
+  return sharedCredential;
+}
+
+/** The default accounts `seedDefaultUsers()` creates, with a known password. */
+export async function seedUsers(): Promise<void> {
+  const p = db();
+  const { hash, salt } = await testCredential();
+  await p.user.deleteMany({});
+  await p.user.createMany({
+    data: (
+      [
+        ['admin', 'admin'], ['qa', 'qa'], ['commercial', 'commercial'],
+        ['planning', 'planning'], ['finance', 'finance'],
+      ] as const
+    ).map(([username, role]) => ({
+      username, name: username, role,
+      passwordHash: hash, passwordSalt: salt,
+      mustChangePassword: false, isActive: true,
+    })),
+  });
+}
+
+/** The whole starting state: clean tables, known users, known records. */
+export async function resetAll(): Promise<void> {
+  if (!DATABASE_AVAILABLE) return;
+  await resetDatabase();
+  await seedUsers();
+  await seedFixture();
+}
+
+/** The body every vendor profile PATCH sends, so a test only states its change. */
+export function profileBody(overrides: Record<string, unknown> = {}) {
+  return {
+    material: 'پاراستامول', materialEn: 'Paracetamol', cas: '103-90-2', irc: '',
+    name: 'فروشندهٔ الف', nameEn: 'Seller A', country: 'Turkey',
+    grade: 'B', status: 'new', isSample: false,
+    manufacturerId: null, supplierId: FIXTURE.supplierA,
+    ...overrides,
+  };
+}
+
+/**
+ * Wait until the change trail stops growing.
+ *
+ * The sign-in handler writes its own audit record and does **not** await it, so
+ * a test that counts rows is racing that write. Waiting for the first row to
+ * appear is not enough — that is what `api.auditRead` did, and on a loaded CI
+ * runner the record could arrive after the wait gave up, land behind the
+ * truncation, and make the seeded 240 rows read as 241. Waiting for the count
+ * to hold still for a moment drains whatever is in flight instead of guessing
+ * how many rows there will be or how long they will take.
+ */
+/**
+ * Wait for a fire-and-forget audit write to land, and return the rows.
+ *
+ * `recordEvent` is deliberately not awaited by the handlers — an audit write
+ * must never turn a successful save into a failed request (rule 16) — so a test
+ * that reads `audit_log` straight after the HTTP response is racing it. On this
+ * machine the write usually wins; on a loaded CI runner it does not, and the
+ * test fails having proved nothing about the code.
+ *
+ * Use this for "the row is there". For "the row is *not* there", waiting for a
+ * row that never comes proves nothing: use `waitForAuditQuiet` first, which
+ * drains whatever is in flight, and then assert on what settled.
+ */
+export async function waitForAudit(where: any, min = 1, timeoutMs = 4000): Promise<any[]> {
+  const deadline = Date.now() + timeoutMs;
+  let rows: any[] = [];
+  for (;;) {
+    rows = await db().auditLog.findMany({ where, orderBy: { timestamp: 'desc' } });
+    if (rows.length >= min || Date.now() >= deadline) return rows;
+    await new Promise(r => setTimeout(r, 25));
+  }
+}
+
+export async function waitForAuditQuiet(quietMs = 250, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let last = -1;
+  let stableSince = 0;
+  while (Date.now() < deadline) {
+    const now = await db().auditLog.count();
+    if (now === last && now > 0) {
+      if (Date.now() - stableSince >= quietMs) return;
+    } else {
+      last = now;
+      stableSince = Date.now();
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+}

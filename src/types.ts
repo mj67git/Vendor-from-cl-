@@ -1,0 +1,234 @@
+import type { SourceGrade, SourceQualification } from './utils/sourceVocabulary';
+
+export type Category = 'foreign' | 'domestic' | 'veterinary' | 'packaging' | 'sample' | 'blacklist';
+
+/**
+ * Where a source stands, and what its departments scored.
+ *
+ * Both are defined once, in `utils/sourceVocabulary.ts`, because the words were
+ * being invented separately in four files. `Grade` still admits the retired
+ * spellings — a row written by an older version can still be holding one, and
+ * `normalizeSourceGrade` is what turns it back into a band on the way in — but
+ * it is no longer `| string`, which admitted everything and therefore said
+ * nothing.
+ */
+export type LegacyStatus = 'تأیید نهایی (معتبر)' | 'نمونه در حال بررسی آزمایشگاهی' | 'رد شده (غیرمجاز)' | 'مشروط' | string;
+export type Status = SourceQualification | LegacyStatus;
+export type LegacyGrade = 'rejected' | 'black list' | 'new';
+export type Grade = SourceGrade | LegacyGrade | null;
+
+export type Role = 'admin' | 'lab' | 'commercial' | 'qa' | 'planning' | 'finance';
+export interface User {
+  username: string;
+  role: Role;
+  name: string;
+  /** Effective permissions from the server: the per-user overrides when set,
+   *  otherwise the role's template. Absent for sessions restored from an older
+   *  cache, in which case the role template applies. */
+  permissions?: string[];
+  /** When this account last signed in *before* the current session. Sent once
+   *  at login and deliberately not refreshed, so it keeps meaning "last time",
+   *  not "this time". */
+  /** True when an admin adjusted this account away from its role template.
+   *  Comes from the server: the client only receives the effective list and so
+   *  cannot tell the two apart by itself. */
+  permissionsCustom?: boolean;
+  previousLoginAt?: string | null;
+  mustChangePassword?: boolean;
+}
+
+export interface AnalysisRecord {
+  id: string;
+  date: string;
+  qcCode: string;
+  decision: 'Pass' | 'Reject' | 'Approved Conditional';
+  deviationReason: 'None' | 'NCR' | 'Deviation' | 'OOS' | 'CAPA' | 'OOT' | 'Complaint' | 'Other';
+  comments: string;
+  recordedBy: string;
+}
+
+export interface Scores {
+  commercial: number;
+  qa: number;
+  planning: number;
+  finance: number;
+}
+
+export interface ActivityLog {
+  id: string;
+  action: string;
+  date: string;
+  user: string;
+}
+
+export interface RiskAssessmentData {
+  materialCriticality: number; // 1-5
+  detectability: number; // 1-5
+  probability: number; // 1-5
+  sps: number;
+  riskScore: number;
+  sri: number;
+  riskLevel: 'Low' | 'Medium' | 'High';
+  date: string;
+  evaluator: string;
+}
+
+export interface Vendor {
+  id: string;
+  category: Category;
+  materialId?: string;
+  material: string;
+  materialEn: string;
+  cas: string;
+  irc: string;
+  name: string;
+  nameEn: string;
+  country: string;
+  grade: Grade;
+  status: Status;
+  scores: Scores | null;
+  rawScores?: Record<string, Record<string, number>>;
+  lastAudit: string | null;
+  ircExpiryDate?: string | null;
+  rejectionReasons: string[] | null;
+  contactInfo?: string;
+  registrationDate?: string;
+  isSample?: boolean;
+  initialSampleStatus?: 'approved' | 'conditional' | 'rejected' | string;
+  /**
+   * A person decided this source is disqualified.
+   *
+   * Separate from `status` because `status` is *derived* — `applyDerivedState`
+   * writes it from the scores — and a column that is both an input and an
+   * output is how the one-way latch formed. A decision persists until a person
+   * reverses it; a score-driven rejection reverses itself when the score does.
+   */
+  rejectedByDecision?: boolean;
+  activityLogs?: ActivityLog[];
+  reasonForChange?: string;
+  riskAssessment?: RiskAssessmentData | null;
+  analysisRecords?: AnalysisRecord[];
+  manufacturerId?: string | null;
+  supplierId?: string | null;
+  /**
+   * When the record was last written, as the server returns it.
+   *
+   * It has always been on the wire — the optimistic-concurrency claim
+   * (`expectedUpdatedAt`) is built from it — but the type did not name it, so
+   * every reader reached for it through `as any`. Optional, because a record
+   * built in the browser before its first save does not have one yet.
+   */
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export type MaterialRole = 'API' | 'Intermediate' | 'Excipient' | 'Solvent' | 'Reagent / Reactant' | 'Packaging Item' | 'Other';
+export type Pharmacopoeia = 'USP' | 'EP' | 'BP' | 'JP' | 'IP' | 'Ph. Eur.' | 'ChP' | 'In-house' | 'Other';
+
+export interface Material {
+  id: string;
+  nameFa: string;
+  nameEn: string;
+  iupac?: string;
+  cas: string;
+  role: MaterialRole;
+  finalProduct: string;
+  finalProductEn: string;
+  pharmacopoeia: Pharmacopoeia;
+  /** File name of the Specification attachment. */
+  specificationFile?: string;
+  specificationFileSize?: number;
+  /** Whether the server actually holds the file. The blob itself is fetched
+      from `GET /api/materials/:id/specification/file` on demand, so it is never
+      carried in a list payload (project rule 5). */
+  hasSpecificationFile?: boolean;
+  specificationUploadedAt?: string;
+  standardNameFa: string;
+  standardNameEn: string;
+  irc?: string;
+  ircReceiveDate?: string;
+  ircExpiryDate?: string;
+  createdAt: string;
+  /**
+   * The row's last write, which the client claims back on the next save so a
+   * stale copy is refused with 409 (project rule 11a).
+   *
+   * The column has existed since migration `20260903100000` and the API has
+   * always returned it; the field was missing here, and the two call sites that
+   * need it reached past the type with `as any`. A cast is not a type — it hid
+   * a real gap between this interface and the record it describes.
+   */
+  updatedAt?: string;
+}
+
+export type BusinessPartnerType = 'Manufacturer' | 'Supplier';
+
+export type SOPDocumentKey = 
+  | 'manufacturerLetter' 
+  | 'authorizedSignatory' 
+  | 'businessLicense' 
+  | 'officialEnglishTranslation' 
+  | 'legalization';
+
+export type SOPDocumentStatus = 'Approved' | 'Permit Approval' | 'Expired' | 'Not Submitted';
+
+export interface SOPDocumentEval {
+  key: SOPDocumentKey;
+  nameFa: string;
+  nameEn: string;
+  status: SOPDocumentStatus | null;
+  score: number;
+  fileName?: string;
+  fileDataUrl?: string;
+  fileSize?: number;
+  uploadedAt?: string;
+}
+
+// Grades produced by calculateGradeAndStatus (rubric: 80/60/40/30).
+/**
+ * Supplier grades. `A`–`D` are the live rubric; `Pending Review` and
+ * `Blacklist` are retired values kept so evaluations stored under earlier
+ * rubrics still render a label a reader recognises (the same treatment the
+ * retired permission names get). Nothing produces them any more.
+ */
+export type SOPGrade = 'A' | 'B' | 'C' | 'D' | 'Pending Review' | 'Blacklist' | 'Not Evaluated';
+export type SOPSupplierStatus =
+  | 'Approved Supplier'
+  | 'Pending Approval'
+  | 'Conditional Approval'
+  | 'Rejected'
+  // Retired with the rubrics that produced them; still readable on stored rows.
+  | 'Approved with Monitoring'
+  | 'Conditional Supplier'
+  | 'Pending Review'
+  | 'Blacklist'
+  | 'Not Evaluated';
+
+export interface SupplierEvaluation {
+  documents: Record<SOPDocumentKey, SOPDocumentEval>;
+  totalScore: number;
+  grade: SOPGrade;
+  status: SOPSupplierStatus;
+  updatedAt?: string;
+  updatedBy?: string;
+}
+
+export interface BusinessPartner {
+  id: string;
+  type: BusinessPartnerType;
+  name: string;
+  nameEn?: string;
+  country: string;
+  city?: string;
+  address?: string;
+  email?: string;
+  contactPerson?: string;
+  phone?: string;
+  website?: string;
+  // manufacturerId was removed with the flat partner model: a supplier is not
+  // owned by a manufacturer, and `business_partners` has no such column.
+  status: 'Active' | 'Inactive' | 'Blacklisted';
+  evaluation?: SupplierEvaluation;
+  createdAt: string;
+  updatedAt: string;
+}
