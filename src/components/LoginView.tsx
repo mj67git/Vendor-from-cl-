@@ -20,55 +20,6 @@ export function LoginView({ onLogin }: LoginViewProps) {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
-  // Local/demo mode: sign in without any backend/database (browser localStorage only).
-  // Shown when explicitly enabled (VITE_ENABLE_LOCAL_DEMO) OR automatically once a
-  // login attempt reveals the backend/database is unavailable — so a no-DB test
-  // deploy needs zero configuration, while a healthy production login never sees it.
-  const localDemoEnabled = (import.meta as any).env?.VITE_ENABLE_LOCAL_DEMO === 'true';
-  const [backendUnavailable, setBackendUnavailable] = useState(false);
-  const showDemoButton = localDemoEnabled || backendUnavailable;
-
-  React.useEffect(() => {
-    fetch('/api/health')
-      .then(res => res.json())
-      .then(data => {
-        if (data.database !== 'up') {
-          setBackendUnavailable(true);
-        }
-      })
-      .catch(() => {
-        setBackendUnavailable(true);
-      });
-  }, []);
-
-  const DEFAULT_USERS_MAP: Record<string, { role: 'admin' | 'commercial' | 'qa' | 'planning' | 'finance' | 'lab'; name: string }> = {
-    admin: { role: 'admin', name: 'مدیر سیستم' },
-    commercial: { role: 'commercial', name: 'واحد بازرگانی' },
-    qa: { role: 'qa', name: 'واحد کیفیت QA' },
-    planning: { role: 'planning', name: 'واحد برنامه‌ریزی و انبار' },
-    finance: { role: 'finance', name: 'واحد مالی و حسابداری' },
-    lab: { role: 'lab', name: 'واحد کنترل کیفیت (آزمایشگاه)' },
-  };
-
-  const performLocalLogin = (userKey?: string) => {
-    const key = (userKey || username || 'admin').toLowerCase().trim();
-    const matched = DEFAULT_USERS_MAP[key] || { role: 'admin', name: username || 'مدیر سیستم' };
-    const demoUser: User = {
-      username: key || 'admin',
-      role: matched.role as any,
-      name: matched.name,
-      mustChangePassword: false,
-    };
-    localStorage.setItem('app_local_mode', 'true');
-    localStorage.setItem('app_currentUser', JSON.stringify(demoUser));
-    localStorage.removeItem('app_jwt_token');
-    onLogin(demoUser);
-  };
-
-  const handleLocalDemoLogin = () => {
-    performLocalLogin('admin');
-  };
-
   const trackCapsLock = (e: React.KeyboardEvent<HTMLInputElement>) => {
     const on = e.getModifierState?.('CapsLock');
     if (typeof on === 'boolean') setCapsLock(on);
@@ -84,59 +35,39 @@ export function LoginView({ onLogin }: LoginViewProps) {
     setLoading(true);
     setError('');
 
-    // If backend is known to be unavailable, log in directly without throwing
-    if (backendUnavailable) {
-      setTimeout(() => {
-        performLocalLogin(username);
-      }, 250);
-      return;
-    }
-
     fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password })
     })
       .then(async (res) => {
-        // Guard against non-JSON responses (e.g. an HTML 500 error page when the
-        // server/database is misconfigured).
         const raw = await res.text();
         let data: any = {};
         try { data = raw ? JSON.parse(raw) : {}; } catch {
-          setBackendUnavailable(true);
-          // Fallback to local authentication seamlessly
-          performLocalLogin(username);
-          return null;
+          throw new Error('پاسخ نامعتبر از سرور دریافت شد.');
         }
         if (!res.ok) {
-          if (res.status === 404 || res.status >= 500 || !data || typeof data.error !== 'string') {
-            setBackendUnavailable(true);
-            // Fallback to local authentication seamlessly
-            performLocalLogin(username);
-            return null;
-          }
-          throw new Error(data.error);
+          throw new Error(data.error || 'نام کاربری یا کلمهٔ عبور اشتباه است.');
         }
         return data;
       })
       .then((data) => {
-        if (!data) return; // handled by local fallback
-        if (data.token && data.user) {
+        if (data?.token && data?.user) {
           localStorage.setItem('app_jwt_token', data.token);
+          localStorage.removeItem('app_local_mode');
+          localStorage.setItem('app_currentUser', JSON.stringify(data.user));
           onLogin(data.user);
         } else {
-          performLocalLogin(username);
+          throw new Error('اطلاعات نشست از سرور دریافت نشد.');
         }
       })
       .catch((err) => {
         console.error("Login verification failed:", err);
-        // A network failure or database down: transparently allow local sign-in
-        if (err instanceof TypeError || /Failed to fetch|NetworkError|پایگاه‌داده/i.test(err?.message || '')) {
-          setBackendUnavailable(true);
-          performLocalLogin(username);
+        if (err instanceof TypeError || /Failed to fetch|NetworkError/i.test(err?.message || '')) {
+          setError('امکان برقراری ارتباط با سرور وجود ندارد. لطفاً از اتصال اینترنت یا در دسترس بودن سرور اطمینان حاصل کنید.');
           return;
         }
-        setError(err.message || 'خطا در ارتباط با سامانهٔ احراز هویت.');
+        setError(err.message || 'خطا در احراز هویت.');
       })
       .finally(() => {
         setLoading(false);
@@ -250,22 +181,6 @@ export function LoginView({ onLogin }: LoginViewProps) {
         <p className="mt-4 text-2xs text-muted-foreground text-center leading-relaxed">
           کلمهٔ عبور را فراموش کرده‌اید؟ بازنشانی رمز فقط توسط مدیر سیستم انجام می‌شود.
         </p>
-
-        {showDemoButton && (
-          <div className="mt-5 pt-4 border-t border-border text-center">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={handleLocalDemoLogin}
-              className="w-full h-11 bg-card border-primary text-primary hover:bg-primary/5 hover:text-primary font-semibold text-sm"
-            >
-              ورود آزمایشی (بدون پایگاه‌داده)
-            </Button>
-            <p className="mt-2 text-2xs text-muted-foreground leading-relaxed">
-              داده‌ها فقط در همین مرورگر ذخیره می‌شوند. برای نسخهٔ نهایی، ورود عادی با پایگاه‌داده استفاده می‌شود.
-            </p>
-          </div>
-        )}
       </div>
     </div>
   );

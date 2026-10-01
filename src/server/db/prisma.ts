@@ -48,9 +48,28 @@ export function isValidPostgresUrl(url?: string | null): boolean {
   }
 }
 
+export function resolveDatabaseUrl(): string | undefined {
+  if (process.env.DATABASE_URL && isValidPostgresUrl(process.env.DATABASE_URL)) {
+    return process.env.DATABASE_URL;
+  }
+  if (process.env.SQL_HOST && process.env.SQL_DB_NAME && (process.env.SQL_USER || process.env.SQL_ADMIN_USER)) {
+    const user = process.env.SQL_ADMIN_USER || process.env.SQL_USER;
+    const password = encodeURIComponent(process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD || "");
+    const dbName = process.env.SQL_DB_NAME;
+    const socketPath = encodeURIComponent(process.env.SQL_HOST);
+    const constructed = `postgresql://${user}:${password}@localhost/${dbName}?host=${socketPath}`;
+    if (isValidPostgresUrl(constructed)) {
+      process.env.DATABASE_URL = constructed;
+      return constructed;
+    }
+  }
+  return process.env.DATABASE_URL;
+}
+
 let _prismaInstance: PrismaClient | null = null;
 export function getPrismaClient(): PrismaClient | null {
-  if (!isValidPostgresUrl(process.env.DATABASE_URL)) {
+  const dbUrl = resolveDatabaseUrl();
+  if (!isValidPostgresUrl(dbUrl)) {
     return null;
   }
   if (!_prismaInstance) {
@@ -58,7 +77,7 @@ export function getPrismaClient(): PrismaClient | null {
       _prismaInstance = new PrismaClient({
         datasources: {
           db: {
-            url: process.env.DATABASE_URL,
+            url: dbUrl,
           },
         },
       });

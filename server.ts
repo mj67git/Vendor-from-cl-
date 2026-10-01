@@ -2,7 +2,7 @@ import path from "path";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 
-import { isValidPostgresUrl } from "./src/server/db/prisma.js";
+import { isValidPostgresUrl, resolveDatabaseUrl } from "./src/server/db/prisma.js";
 import { requestContext } from "./src/server/http/requestContext.js";
 import { securityHeaders } from "./src/server/http/securityHeaders.js";
 import { seedDefaultUsers } from "./src/server/repositories/userRepository.js";
@@ -56,7 +56,8 @@ async function startServer() {
 
   // PostgreSQL is the single source of truth. Verify connectivity and provision
   // the default accounts on first startup before serving any request.
-  if (!isValidPostgresUrl(process.env.DATABASE_URL)) {
+  const activeDbUrl = resolveDatabaseUrl();
+  if (!isValidPostgresUrl(activeDbUrl)) {
     console.error(
       "[FATAL] DATABASE_URL is missing or invalid. A valid PostgreSQL connection is required to start the server.",
     );
